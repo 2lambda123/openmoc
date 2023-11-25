@@ -199,6 +199,9 @@ protected:
   /** Boolean to indicate whether there are any fixed sources */
   bool _fixed_sources_on;
 
+  /** Boolean to indicate whether fixed sources needs to be initialized */
+  bool _fixed_sources_initialized;
+
   /** Boolean for whether to correct unphysical cross-sections */
   bool _correct_xs;
 
@@ -224,6 +227,9 @@ protected:
 
   /** Boolean for whether the solver allows negative fluxes */
   bool _negative_fluxes_allowed;
+
+  /** Boolean for whether negative sources are printed after each iteration */
+  bool _print_negative_sources;
 
   /** File to load initial FSR fluxes from */
   std::string _initial_FSR_fluxes_file;
@@ -318,6 +324,9 @@ protected:
   /** A string indicating the type of source approximation */
   std::string _source_type;
 
+  /** A boolean to know which type of solver is being used */
+  bool _gpu_solver;
+
   /**
    * @brief Initializes Track boundary angular flux and leakage and
    *        FSR scalar flux arrays.
@@ -332,8 +341,9 @@ protected:
   /* Initialize interp. tables, constants for computing source exponentials */
   virtual void initializeExpEvaluators();
 
-  /* Build fission matrices, transpose production for adjoint calculations */
-  void initializeMaterials(solverMode mode);
+  /* Build fission matrices, transpose production for adjoint calculations
+   * Must be virtual for the GPU solver to override this */
+  virtual void initializeMaterials(solverMode mode);
 
   virtual void initializeFSRs();
   void countFissionableFSRs();
@@ -430,12 +440,14 @@ public:
   Solver(TrackGenerator* track_generator=NULL);
   virtual ~Solver();
 
-  void setGeometry(Geometry* geometry);
-
+  /* Geometry and ray tracing */
+  virtual void setGeometry(Geometry* geometry);
   Geometry* getGeometry();
   TrackGenerator* getTrackGenerator();
   FP_PRECISION getFSRVolume(long fsr_id);
   int getNumPolarAngles();
+
+  /* Solver characteristics */
   int getNumIterations();
   double getTotalTime();
   double getKeff();
@@ -457,32 +469,44 @@ public:
   void loadInitialFSRFluxes(std::string fname);
   void loadFSRFluxes(std::string fname, bool assign_k_eff=false, double tolerance=0.01);
 
-  double getFlux(long fsr_id, int group);
+  virtual double getFlux(long fsr_id, int group);
   virtual void getFluxes(FP_PRECISION* out_fluxes, int num_fluxes) = 0;
-  double getFSRSource(long fsr_id, int group);
+  virtual double getFSRSource(long fsr_id, int group);
 
-  void setTrackGenerator(TrackGenerator* track_generator);
+  virtual void setTrackGenerator(TrackGenerator* track_generator);
   void setConvergenceThreshold(double threshold);
   virtual void setFluxes(FP_PRECISION* in_fluxes, int num_fluxes) = 0;
+
+  /* Setting fixed sources */
   virtual void setFixedSourceByFSR(long fsr_id, int group, double source);
   void setFixedSourceByCell(Cell* cell, int group, double source);
   void setFixedSourceByMaterial(Material* material, int group,
                                 double source);
+  virtual void resetFixedSources() = 0;
+
+  /* Exponential terms options */
   void setMaxOpticalLength(FP_PRECISION max_optical_length);
   void setExpPrecision(double precision);
   void useExponentialInterpolation();
   void useExponentialIntrinsic();
-  void setSolverMode(solverMode solver_mode);
-  void setRestartStatus(bool is_restart);
+
+  /* Negative fluxes and sources treatment */
   void allowNegativeFluxes(bool negative_fluxes_on);
+  void printAllNegativeSources(bool print_negative_sources);
   void correctXS();
   void stabilizeTransport(double stabilization_factor,
                           stabilizationType stabilization_type=DIAGONAL);
+
+  /* Initial guesses for the flux */
+  void setRestartStatus(bool is_restart);
   void setInitialSpectrumCalculation(double threshold);
   void setCheckXSLogLevel(logLevel log_level);
   void setChiSpectrumMaterial(Material* material);
   void resetMaterials(solverMode mode);
+  void computeInitialFluxGuess(bool is_source_computation=false);
 
+  /* General / highest level solver sweeps and routines */
+  void setSolverMode(solverMode solver_mode);
   void fissionTransportSweep();
   void scatterTransportSweep();
   void computeFlux(int max_iters=1000, bool only_fixed_source=true);
@@ -491,7 +515,9 @@ public:
   void computeEigenvalue(int max_iters=1000,
                          residualType res_type=FISSION_SOURCE);
 
+#ifdef BGQ
   void printBGQMemory();
+#endif
 
  /**
   * @brief Computes the volume-weighted, energy integrated fission rate in
@@ -533,6 +559,12 @@ public:
                               int reset_iteration);
   void checkLimitXS(int iteration);
 
+#ifdef MPIx
+  /** Functions to check the MPI implemtation, accessible from Python */
+  virtual void printCycle(long track_start, int domain_start, int length)=0;
+  virtual void printLoadBalancingReport()=0;
+  virtual void boundaryFluxChecker()=0;
+#endif
 
   /**
    * @brief Activate On-The-Fly transport, to OTF ray-trace and propagate the
@@ -541,6 +573,14 @@ public:
   inline void setOTFTransport() {
     _OTF_transport = true;
     log_printf(NORMAL, "Using On-The-Fly transport");
+  }
+
+  /**
+   * @brief Return the number of energy groups
+   * @return the number of energy groups
+   */
+  inline int getNumEnergyGroups() {
+    return _num_groups;
   }
 };
 

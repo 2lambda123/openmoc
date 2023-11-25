@@ -121,6 +121,9 @@ private:
   /** Number of cells in z direction */
   int _num_z;
 
+  /** Sweep number on MOC side */
+  int _moc_iteration;
+
   /** Number of energy groups */
   int _num_moc_groups;
 
@@ -244,8 +247,14 @@ private:
   /** Flag indicating whether to check neutron balance on every CMFD solve */
   bool _check_neutron_balance;
 
+  /** Flag indicating whether to print prolongation factors at every solve */
+  bool _print_cmfd_prolongation_ratios;
+
   /** Whether to allow the CMFD solver to work with / return negative fluxes */
   bool _negative_fluxes_allowed;
+
+  /** Number of MOC iterations before the CMFD update ratios are limited */
+  int _num_unbounded_iterations;
 
   /** Number of cells to use in updating MOC flux */
   int _k_nearest;
@@ -345,7 +354,7 @@ private:
   /* Private worker functions */
   CMFD_PRECISION computeLarsensEDCFactor(CMFD_PRECISION dif_coef,
                                          CMFD_PRECISION delta);
-  void constructMatrices(int moc_iteration);
+  void constructMatrices();
   void collapseXS();
   void updateMOCFlux();
   void rescaleFlux();
@@ -370,8 +379,7 @@ private:
   double getDistanceToCentroid(Point* centroid, int cell_id, int local_cell_id,
                                int stencil_index);
   void getSurfaceDiffusionCoefficient(int cmfd_cell, int surface,
-        int group, int moc_iteration, CMFD_PRECISION& dif_surf,
-        CMFD_PRECISION& dif_surf_corr);
+        int group, CMFD_PRECISION& dif_surf, CMFD_PRECISION& dif_surf_corr);
   CMFD_PRECISION getDiffusionCoefficient(int cmfd_cell, int group);
   CMFD_PRECISION getSurfaceWidth(int surface, int global_ind);
   CMFD_PRECISION getPerpendicularSurfaceWidth(int surface, int global_ind);
@@ -387,7 +395,7 @@ private:
   void unpackSplitCurrents(bool faces);
   void copyFullSurfaceCurrents();
   void checkNeutronBalance(bool pre_split=true, bool old_source=false);
-  void printProlongationFactors(int iteration);
+  void printProlongationFactors();
 
 public:
 
@@ -413,9 +421,12 @@ public:
   void tallyStartingCurrent(Point* point, double delta_x, double delta_y,
                             double delta_z, float* track_flux, double weight);
   void recordNetCurrents();
+
+  /* Debug and information output */
   void printInputParamsSummary();
   void printTimerReport();
   void checkBalance();
+  void printProlongation();
 
   /* Get parameters */
   int getNumCmfdGroups();
@@ -427,6 +438,7 @@ public:
   int getNumX();
   int getNumY();
   int getNumZ();
+  int getLocalNumZ();
   Vector* getLocalCurrents();
   CMFD_PRECISION*** getBoundarySurfaceCurrents();
   int convertFSRIdToCmfdCell(long fsr_id);
@@ -455,6 +467,7 @@ public:
   void setGroupStructure(std::vector< std::vector<int> > group_indices);
   void setSourceConvergenceThreshold(double source_thresh);
   void setQuadrature(Quadrature* quadrature);
+  void setNumUnboundedIterations(int unbounded_iterations);
   void setKNearest(int k_nearest);
   void setSolve3D(bool solve_3d);
   void setAzimSpacings(const std::vector<double>& azim_spacings,
@@ -489,6 +502,9 @@ public:
 
   /* For debug use */
   void printCmfdCellSizes();
+
+  /* For printing infomation about the CMFD object */
+  std::string toString();
 };
 
 
@@ -577,7 +593,7 @@ inline void Cmfd::tallyCurrent(segment* curr_segment, float* track_flux,
 
     CMFD_PRECISION currents[_num_cmfd_groups]
          __attribute__ ((aligned(VEC_ALIGNMENT)));
-    memset(&currents[0], 0, _num_cmfd_groups * sizeof(CMFD_PRECISION));
+    memset(currents, 0, _num_cmfd_groups * sizeof(CMFD_PRECISION));
     int local_cell_id = getLocalCMFDCell(cell_id);
 
     if (_SOLVE_3D) {
@@ -611,6 +627,9 @@ inline void Cmfd::tallyCurrent(segment* curr_segment, float* track_flux,
           _edge_corner_currents[first_ind+g] += currents[g];
 
         omp_unset_lock(&_edge_corner_lock);
+#ifdef INTEL
+#pragma omp flush
+#endif
       }
     }
     else {
@@ -643,7 +662,9 @@ inline void Cmfd::tallyCurrent(segment* curr_segment, float* track_flux,
           _edge_corner_currents[first_ind+g] += currents[g];
 
         omp_unset_lock(&_edge_corner_lock);
-
+#ifdef INTEL
+#pragma omp flush
+#endif
       }
     }
   }

@@ -23,7 +23,7 @@ class CmfdPwrAssemblyTestHarness(TestHarness):
 
         super(CmfdPwrAssemblyTestHarness, self)._create_geometry()
 
-        # Change boundary condition on one side to vacuum
+        # Change boundary condition on two opposite sides to periodic
         cell_id = list(self.input_set.geometry.getRootUniverse().getCells())[0]
         surface_id = list(self.input_set.geometry.getRootUniverse().getCells()[
              cell_id].getSurfaces())[0]

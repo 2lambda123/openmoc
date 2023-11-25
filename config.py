@@ -59,6 +59,9 @@ class configuration:
     # Default floating point for the main openmoc module is single precision
     fp = 'single'
 
+    # The number of energy groups to compile for is by default not specified
+    num_groups = None
+
     # Compile using ccache (for developers needing fast recompilation)
     with_ccache = False
 
@@ -83,11 +86,11 @@ class configuration:
     # that the number of energy groups is be fit too a multiple of this
     # vector_length, and restructuring the innermost loops in the solver to
     # loop from 0 to the vector length
-    vector_length = 32
+    vector_length = 8
 
     # The vector alignment used in the VectorizedSolver class when allocating
     # aligned data structures using MM_MALLOC and MM_FREE
-    vector_alignment = 32
+    vector_alignment = 64
 
     # List of C/C++/CUDA distutils.extension objects which are created based
     # on which flags are specified at compile time.
@@ -148,7 +151,6 @@ class configuration:
 
 
     sources['nvcc'] = ['openmoc/cuda/openmoc_cuda_wrap.cpp',
-                       'src/accel/cuda/GPUExpEvaluator.cu',
                        'src/accel/cuda/GPUQuery.cu',
                        'src/accel/cuda/clone.cu',
                        'src/accel/cuda/GPUSolver.cu']
@@ -166,7 +168,7 @@ class configuration:
     compiler_flags['mpicc'] = ['-c', '-O3', '-ffast-math', '-fopenmp',
                                '-std=c++11', '-fpic', '-march=native']
     compiler_flags['clang'] = ['-c', '-O3', '-ffast-math', '-std=c++11',
-                               '-fopenmp', '-fvectorize', '-fpic',
+                               '-Xpreprocessor -fopenmp', '-fvectorize', '-fpic',
                                '-Qunused-arguments',
                                '-Wno-deprecated-register',
                                '-Wno-parentheses-equality',
@@ -178,8 +180,7 @@ class configuration:
                                '-qsmp=omp', '-qpic']
     compiler_flags['nvcc'] =  ['--relocatable-device-code', 'true',
                                '-c', '-O3',  '-std=c++11',
-                               '--compiler-options', '-fpic',
-                               '-arch=compute_20']
+                               '--compiler-options', '-fpic', '--use_fast_math']
 
 
     ###########################################################################
@@ -190,13 +191,22 @@ class configuration:
     linker_flags = dict()
 
     if ('macosx' in get_platform()):
-        python_lib = sysconfig.get_config_vars('BLDLIBRARY')[0].split()[1]
-        linker_flags['gcc'] = ['-fopenmp', '-dynamiclib', python_lib,
+        linker_flags['gcc'] = ['-fopenmp', '-dynamiclib',
                               '-Wl,-install_name,' + get_openmoc_object_name()]
-        linker_flags['mpicc'] = ['-fopenmp', '-dynamiclib', python_lib,
+        linker_flags['mpicc'] = ['-fopenmp', '-dynamiclib',
                               '-Wl,-install_name,' + get_openmoc_object_name()]
-        linker_flags['clang'] = ['-fopenmp', '-dynamiclib', python_lib,
+        linker_flags['clang'] = ['-Xpreprocessor', '-fopenmp', '-dynamiclib',
                               '-Wl,-install_name,' + get_openmoc_object_name()]
+        # Don't dynamically link python with conda which statically linked it
+        if ('conda' not in sys.version and 'Continuum' not in sys.version):
+            python_lib = sysconfig.get_config_vars('BLDLIBRARY')[0].split()[1]
+            linker_flags['gcc'].append(python_lib)
+            linker_flags['mpicc'].append(python_lib)
+            linker_flags['clang'].append(python_lib)
+        else:
+            linker_flags['gcc'].extend(('-undefined', 'dynamic_lookup'))
+            linker_flags['mpicc'].extend(('-undefined', 'dynamic_lookup'))
+            linker_flags['clang'].extend(('-undefined', 'dynamic_lookup'))
     else:
         linker_flags['gcc'] = ['-fopenmp', '-shared',
                                '-Wl,-soname,' + get_openmoc_object_name()]
@@ -335,10 +345,10 @@ class configuration:
     # add flags for vector size and alignment for SIMD vectorization
     for compiler in macros:
         for precision in macros[compiler]:
-            macros[compiler][precision].append(('VEC_LENGTH', vector_length))
             macros[compiler][precision].append(('VEC_ALIGNMENT',
                                                 vector_alignment))
-
+        macros[compiler]['single'].append(('VEC_LENGTH', vector_length))
+        macros[compiler]['double'].append(('VEC_LENGTH', vector_length//2))
 
     # set extra flag for determining precision
     for compiler in macros:
@@ -356,9 +366,10 @@ class configuration:
 
     # set CMFD precision and linear algebra solver tolerance
     for compiler in macros:
-        for precision in macros[compiler]:
-            macros[compiler][precision].append(('CMFD_PRECISION', 'double'))
-            macros[compiler][precision].append(('LINALG_TOL', 1E-15))
+        macros[compiler]['single'].append(('CMFD_PRECISION', 'float'))
+        macros[compiler]['single'].append(('LINALG_TOL', 1E-7))
+        macros[compiler]['double'].append(('CMFD_PRECISION', 'double'))
+        macros[compiler]['double'].append(('LINALG_TOL', 1E-15))
 
 
     def setup_extension_modules(self):
@@ -368,12 +379,22 @@ class configuration:
         Python package based on the user-defined flags defined at compile time.
         """
 
+        # If user wishes to specify number of groups at compile time
+        if self.num_groups:
+            for k in self.compiler_flags:
+                self.compiler_flags[k].append('-DNGROUPS=' +
+                                              str(self.num_groups))
+
         # If the user wishes to compile using debug mode, append the debugging
         # flag to all lists of compiler flags for all distribution types
         if self.debug_mode:
             for k in self.compiler_flags:
                 self.compiler_flags[k].append('-g')
-                self.compiler_flags[k].append('-fno-omit-frame-pointer')
+
+                # As of September 2019, nvcc does not support this flag:
+                if k != 'nvcc':
+                    self.compiler_flags[k].append('-fno-omit-frame-pointer')
+
                 ind = [i for i, item in enumerate(self.compiler_flags[k]) \
                        if item.startswith('-O')]
                 self.compiler_flags[k][ind[0]] = '-O0'

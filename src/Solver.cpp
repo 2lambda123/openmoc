@@ -71,6 +71,7 @@ Solver::Solver(TrackGenerator* track_generator) {
   _is_restart = false;
   _user_fluxes = false;
   _fixed_sources_on = false;
+  _fixed_sources_initialized = false;
   _correct_xs = false;
   _stabilize_transport = false;
   _verbose = false;
@@ -79,9 +80,10 @@ Solver::Solver(TrackGenerator* track_generator) {
   _load_initial_FSR_fluxes = false;
   _calculate_residuals_by_reference = false;
   _negative_fluxes_allowed = false;
+  _print_negative_sources = false;
   _OTF_transport = false;
-
   _xs_log_level = ERROR;
+  _gpu_solver = false;
 
   //FIXME Parameters for xs modification, should be deleted
   _reset_iteration = -1;
@@ -492,6 +494,7 @@ void Solver::setFixedSourceByFSR(long fsr_id, int group, double source) {
                "%d FSRs in the geometry", fsr_id, _num_FSRs);
 
   _fixed_sources_on = true;
+  _fixed_sources_initialized = false;
   _fix_src_FSR_map[std::pair<int, int>(fsr_id, group)] = source;
 }
 
@@ -507,6 +510,7 @@ void Solver::setFixedSourceByFSR(long fsr_id, int group, double source) {
 void Solver::setFixedSourceByCell(Cell* cell, int group, double source) {
 
   _fixed_sources_on = true;
+  _fixed_sources_initialized = false;
 
   /* Recursively add the source to all Cells within a FILL type Cell */
   if (cell->getType() == FILL) {
@@ -534,6 +538,7 @@ void Solver::setFixedSourceByCell(Cell* cell, int group, double source) {
 void Solver::setFixedSourceByMaterial(Material* material, int group,
                                       double source) {
   _fixed_sources_on = true;
+  _fixed_sources_initialized = false;
   _fix_src_material_map[std::pair<Material*, int>(material, group)] = source;
 }
 
@@ -617,6 +622,15 @@ void Solver::setRestartStatus(bool is_restart) {
  */
 void Solver::allowNegativeFluxes(bool negative_fluxes_on) {
   _negative_fluxes_allowed = negative_fluxes_on;
+}
+
+
+/**
+ * @brief Set whether to print negative sources at each iteration.
+ * @param print_negative_sources whether to print negative sources
+ */
+void Solver::printAllNegativeSources(bool print_negative_sources) {
+  _print_negative_sources = print_negative_sources;
 }
 
 
@@ -791,6 +805,9 @@ void Solver::initializeMaterials(solverMode mode) {
     if (mode == ADJOINT)
       m_iter->second->transposeProductionMatrices();
   }
+
+  /* GPU solver needs this */
+  _num_materials = _geometry->getNumMaterials();
 }
 
 
@@ -1108,6 +1125,7 @@ void Solver::initializeFixedSources() {
     group = mat_group_key.second;
     source = _fix_src_material_map[mat_group_key];
 
+    /* Search for this Material in all FSRs */
     for (long r=0; r < _num_FSRs; r++) {
       fsr_material = _geometry->findFSRMaterial(r);
       if (mat_group_key.first->getId() == fsr_material->getId())
@@ -1152,7 +1170,8 @@ void Solver::initializeCmfd() {
   _cmfd->setQuadrature(_quad);
   _cmfd->setGeometry(_geometry);
   _cmfd->setAzimSpacings(_quad->getAzimSpacings(), _num_azim);
-  _cmfd->initialize();
+  if (!_is_restart)
+    _cmfd->initialize();
 
 
   TrackGenerator3D* track_generator_3D =
@@ -1212,6 +1231,12 @@ void Solver::calculateInitialSpectrum(double threshold) {
   spectrum_calculator.setQuadrature(_quad);
   spectrum_calculator.setAzimSpacings(_quad->getAzimSpacings(), _num_azim);
   spectrum_calculator.initialize();
+
+  TrackGenerator3D* track_generator_3D =
+    dynamic_cast<TrackGenerator3D*>(_track_generator);
+  if (track_generator_3D != NULL)
+    spectrum_calculator.setPolarSpacings(_quad->getPolarSpacings(), _num_azim,
+         _num_polar);
 
   /* Solve the system */
   log_printf(NORMAL, "Computing K-eff");
@@ -1347,8 +1372,8 @@ void Solver::computeFlux(int max_iters, bool only_fixed_source) {
   /* Initialize data structures */
   initializeMaterials(_solver_mode);
   initializeFSRs();
-  initializeSourceArrays();
   countFissionableFSRs();
+  initializeSourceArrays();
   initializeExpEvaluators();
 
   /* Initialize new flux arrays if a) the user requested the use of
@@ -1457,13 +1482,8 @@ void Solver::computeSource(int max_iters, double k_eff, residualType res_type) {
     initializeFluxArrays();
   initializeSourceArrays();
 
-  /* Guess flat spatial scalar flux for each region */
-  if (!_is_restart) {
-    if (_chi_spectrum_material == NULL)
-      flattenFSRFluxes(1.0);
-    else
-      flattenFSRFluxesChiSpectrum();
-  }
+  /* Compute a starting guess for the fluxes */
+  computeInitialFluxGuess(true);
 
   /* Start the timer to record the total time to converge the flux */
   _timer->startTimer();
@@ -1529,7 +1549,9 @@ void Solver::computeEigenvalue(int max_iters, residualType res_type) {
 
   /* Clear all timing data from a previous simulation run */
   clearTimerSplits();
-  _num_iterations = 0;
+
+  /* Reset number of iterations, start at 1 if restarting */
+  _num_iterations = _is_restart;
 
   /* Start the timers to record the total solve and initialization times */
   _timer->startTimer();
@@ -1557,52 +1579,13 @@ void Solver::computeEigenvalue(int max_iters, residualType res_type) {
 #endif
   printInputParamsSummary();
 
-  /* Load reference solution if necessary */
-  if (_calculate_residuals_by_reference) {
-    loadFSRFluxes(_reference_file, false);
-    long size = _num_FSRs * _num_groups;
-    _reference_flux = new FP_PRECISION[size];
-    memcpy(_reference_flux, _scalar_flux, size * sizeof(FP_PRECISION));
-  }
-
-  /* Guess flat spatial scalar flux for each region */
-  if (!_is_restart) {
-    if (_chi_spectrum_material == NULL)
-      flattenFSRFluxes(1.0);
-    else
-      flattenFSRFluxesChiSpectrum();
-    normalizeFluxes();
-  }
-  storeFSRFluxes();
-
-  /* Load initial FSR fluxes from file if requested */
-  if (_load_initial_FSR_fluxes) {
-    loadFSRFluxes(_initial_FSR_fluxes_file, true);
-    normalizeFluxes();
-    storeFSRFluxes();
-
-#ifdef MPIx
-  if (_geometry->isDomainDecomposed())
-    MPI_Barrier(_geometry->getMPICart());
-#endif
-
-    int startup_iterations = 30;
-    computeFSRSources(0);
-    for (int i=0; i < startup_iterations; i++) {
-      log_printf(NORMAL, "Startup sweep %d / %d", i, startup_iterations);
-      transportSweep();
-    }
-    addSourceToScalarFlux();
-  }
-
   /* Print memory report */
 #ifdef BGQ
   printBGQMemory();
 #endif
 
-  /* Perform initial spectrum calculation if requested */
-  if (_calculate_initial_spectrum)
-    calculateInitialSpectrum(_initial_spectrum_thresh);
+  /* Compute a starting guess for the fluxes */
+  computeInitialFluxGuess();
 
 #ifdef MPIx
   if (_geometry->isDomainDecomposed())
@@ -1610,15 +1593,12 @@ void Solver::computeEigenvalue(int max_iters, residualType res_type) {
 #endif
 
   /* Create object to track convergence data if requested */
-  ConvergenceData* convergence_data = NULL;
-  if (_verbose) {
-    if (_cmfd != NULL) {
-      convergence_data = new ConvergenceData;
-      _cmfd->setConvergenceData(convergence_data);
-      log_printf(NORMAL, "iter   k-eff   eps-k  eps-MOC   D.R.   "
+  ConvergenceData convergence_data;
+  if (_verbose && _cmfd != NULL) {
+    _cmfd->setConvergenceData(&convergence_data);
+    log_printf(NORMAL, "iter   k-eff   eps-k  eps-MOC   D.R.   "
                "eps-FS1   eps-FSN   #FS  eps-flux1 eps-fluxN"
                "  #FX1 #FXN  MAX P.F.");
-    }
   }
 
   /* Stop timer for solver initialization */
@@ -1645,7 +1625,7 @@ void Solver::computeEigenvalue(int max_iters, residualType res_type) {
 
     /* Solve CMFD diffusion problem and update MOC flux */
     if (_cmfd != NULL && _cmfd->isFluxUpdateOn())
-      _k_eff = _cmfd->computeKeff(i);
+      _k_eff = _cmfd->computeKeff(_num_iterations);
     else
       computeKeff();
 
@@ -1665,26 +1645,26 @@ void Solver::computeEigenvalue(int max_iters, residualType res_type) {
     k_prev = _k_eff;
 
     /* Ouptut iteration report */
-    if (_verbose && convergence_data != NULL) {
+    if (_verbose && _cmfd != NULL) {
 
       /* Unpack convergence data */
-      double pf = convergence_data->pf;
-      double cmfd_res_1 = convergence_data->cmfd_res_1;
-      double cmfd_res_end = convergence_data->cmfd_res_end;
-      double linear_res_1 = convergence_data->linear_res_1;
-      double linear_res_end = convergence_data->linear_res_end;
-      int cmfd_iters = convergence_data->cmfd_iters;
-      int linear_iters_1 = convergence_data->linear_iters_1;
-      int linear_iters_end = convergence_data->linear_iters_end;
+      double pf = convergence_data.pf;
+      double cmfd_res_1 = convergence_data.cmfd_res_1;
+      double cmfd_res_end = convergence_data.cmfd_res_end;
+      double linear_res_1 = convergence_data.linear_res_1;
+      double linear_res_end = convergence_data.linear_res_end;
+      int cmfd_iters = convergence_data.cmfd_iters;
+      int linear_iters_1 = convergence_data.linear_iters_1;
+      int linear_iters_end = convergence_data.linear_iters_end;
       log_printf(NORMAL, "%3d  %1.6f  %5d  %1.6f  %1.3f  %1.6f  %1.6f"
-                 "  %3d  %1.6f  %1.6f  %3d  %3d    %1.6f", i, _k_eff,
+                 "  %3d  %1.6f  %1.6f  %3d  %3d    %.4e", i, _k_eff,
                  dk, residual, dr, cmfd_res_1, cmfd_res_end,
                  cmfd_iters, linear_res_1, linear_res_end,
                  linear_iters_1, linear_iters_end, pf);
     }
     else {
       log_printf(NORMAL, "Iteration %d:  k_eff = %1.6f   "
-                 "res = %1.3E  delta-k (pcm) = %d D.R. = %1.2f", i, _k_eff,
+                 "res = %1.3E  delta-k (pcm) = %d D.R. = %1.4f", i, _k_eff,
                  residual, dk, dr);
     }
 
@@ -1697,7 +1677,7 @@ void Solver::computeEigenvalue(int max_iters, residualType res_type) {
     _num_iterations++;
 
     /* Check for convergence of the fission source distribution */
-    if (i > 1 && residual < _converge_thresh && std::abs(dk) < 1)
+    if (residual < _converge_thresh && std::abs(dk) < 1)
       break;
   }
 
@@ -1706,9 +1686,74 @@ void Solver::computeEigenvalue(int max_iters, residualType res_type) {
 
   _timer->stopTimer();
   _timer->recordSplit("Total time");
+}
 
-  if (convergence_data != NULL)
-    delete convergence_data;
+
+/**
+ * @brief Load or compute a starting guess for scalar fluxes.
+ * @details By default, OpenMOC assumes an initial flux guess flat in space and
+ *          energy. Other options are available:
+ *          - reference fluxes can be loaded as an initial guess. They will
+ *            also be used to compute the residuals
+ *          - a chi-spectrum from a fissile material can be assumed. Only
+ *            fissile region will have a non-zero initial flux guess. Note
+ *            that this may induce 0 reaction rates in CMFD cells, and startup
+ *            unaccelerated iterations may be required
+ *          - scalar fluxes can be loaded from a flux file, to perform a
+ *            restart calculation. The angular fluxes need to converged
+ *            again since they are not saved in the flux file
+ *          - a 1-cell 1-group CMFD calculation can be run to compute an
+ *            initial spectrum guess
+ * @param is_source_computation whether the solver is computing an eigenvalue
+ *        or a source distribution
+ */
+void Solver::computeInitialFluxGuess(bool is_source_computation) {
+
+  /* Load reference solution if necessary */
+  if (_calculate_residuals_by_reference) {
+    loadFSRFluxes(_reference_file, false);
+    long size = _num_FSRs * _num_groups;
+    _reference_flux = new FP_PRECISION[size];
+    memcpy(_reference_flux, _scalar_flux, size * sizeof(FP_PRECISION));
+  }
+
+  /* Guess flat spatial scalar flux for each region */
+  if (!_is_restart) {
+    if (_chi_spectrum_material == NULL)
+      flattenFSRFluxes(1.0);
+    else
+      flattenFSRFluxesChiSpectrum();
+
+    /* Normalize flux guess for eigenvalue computations */
+    if (!is_source_computation)
+      normalizeFluxes();
+  }
+  storeFSRFluxes();
+
+  /* Load initial FSR fluxes from file if requested */
+  if (_load_initial_FSR_fluxes) {
+    loadFSRFluxes(_initial_FSR_fluxes_file, true);
+    normalizeFluxes();
+    storeFSRFluxes();
+
+#ifdef MPIx
+    if (_geometry->isDomainDecomposed())
+      MPI_Barrier(_geometry->getMPICart());
+#endif
+
+    /* Perform startup sweeps to converge angular fluxes */
+    int startup_iterations = 30;
+    computeFSRSources(0);
+    for (int i=0; i < startup_iterations; i++) {
+      log_printf(NORMAL, "Startup sweep %d / %d", i, startup_iterations);
+      transportSweep();
+    }
+    addSourceToScalarFlux();
+  }
+
+  /* Perform initial spectrum calculation if requested */
+  if (_calculate_initial_spectrum)
+    calculateInitialSpectrum(_initial_spectrum_thresh);
 }
 
 
@@ -1717,7 +1762,28 @@ void Solver::computeEigenvalue(int max_iters, residualType res_type) {
  *        code in the source convergence loop.
  */
 void Solver::clearTimerSplits() {
+
+  /* Solver and sweep timers */
   _timer->clearSplit("Total time");
+  _timer->clearSplit("Solver initialization");
+  _timer->clearSplit("Transport Sweep");
+#ifdef MPIx
+  _timer->clearSplit("Total transfer time");
+  _timer->clearSplit("Packing time");
+  _timer->clearSplit("Communication time");
+  _timer->clearSplit("Unpacking time");
+  _timer->clearSplit("Idle time");
+#endif
+
+  /* CMFD timers */
+  _timer->clearSplit("Total CMFD time");
+  _timer->clearSplit("Total collapse time");
+  _timer->clearSplit("Matrix construction time");
+#ifdef MPIx
+  _timer->clearSplit("CMFD MPI communication time");
+#endif
+  _timer->clearSplit("Total solver time");
+  _timer->clearSplit("Total MOC flux update time");
 }
 
 
@@ -1766,30 +1832,34 @@ void Solver::printTimerReport() {
   msg_string.resize(53, '.');
   log_printf(RESULT, "%s%1.4E sec", msg_string.c_str(), transport_sweep);
 
-  double transfer_time = 0.;
-  double idle_time = 0.;
 #ifdef MPIx
   /* Boundary track angular fluxes transfer */
-  transfer_time = _timer->getSplit("Total transfer time");
-  msg_string = "    Angular Flux Transfer";
+  double transfer_time = _timer->getSplit("Total transfer time");
+  msg_string = "  Angular Flux Transfer";
   msg_string.resize(53, '.');
   log_printf(RESULT, "%s%1.4E sec", msg_string.c_str(), transfer_time);
 
   /* Boundary track angular fluxes packing into buffers */
   double pack_time = _timer->getSplit("Packing time");
-  msg_string = "      Angular Flux Packing Time";
+  msg_string = "    Angular Flux Packing Time";
   msg_string.resize(53, '.');
   log_printf(RESULT, "%s%1.4E sec", msg_string.c_str(), pack_time);
 
   /* Communication of track angular fluxes */
   double comm_time = _timer->getSplit("Communication time");
-  msg_string = "      Angular Flux Communication Time";
+  msg_string = "    Angular Flux Communication Time";
   msg_string.resize(53, '.');
   log_printf(RESULT, "%s%1.4E sec", msg_string.c_str(), comm_time);
 
+  /* Boundary track angular fluxes packing into buffers */
+  double unpack_time = _timer->getSplit("Unpacking time");
+  msg_string = "    Angular Flux Unpacking Time";
+  msg_string.resize(53, '.');
+  log_printf(RESULT, "%s%1.4E sec", msg_string.c_str(), unpack_time);
+
   /* Idle time between transport sweep and angular fluxes transfer */
-  idle_time = _timer->getSplit("Idle time");
-  msg_string = "    Total Idle Time Between Sweeps";
+  double idle_time = _timer->getSplit("Idle time");
+  msg_string = "  Total Idle Time Between Sweep and Transfer";
   msg_string.resize(53, '.');
   log_printf(RESULT, "%s%1.4E sec", msg_string.c_str(), idle_time);
 #endif
@@ -1830,13 +1900,33 @@ void Solver::printTimerReport() {
 
   long num_integrations = 2 * _fluxes_per_track * total_num_segments *
       _num_iterations;
-  double time_per_integration = ((transport_sweep - transfer_time - idle_time) /
-                                 num_integrations * (omp_get_max_threads() *
-                                 num_ranks));
+  double time_per_integration = transport_sweep / num_integrations *
+                                (omp_get_max_threads() * num_ranks);
+  double time_per_integ_total = tot_time / num_integrations *
+                                (omp_get_max_threads() * num_ranks);
 
-  msg_string = "Integration time by segment-group-thread (w/o idle)";
-  msg_string.resize(53, '.');
-  log_printf(RESULT, "%s%1.4E sec", msg_string.c_str(), time_per_integration);
+  if (!_gpu_solver) {
+    msg_string = "Integration time by segment-group-thread (sweep)";
+    msg_string.resize(53, '.');
+    log_printf(RESULT, "%s%1.4E sec", msg_string.c_str(),
+               time_per_integration);
+
+    msg_string = "Integration time by segment-group-thread (total)";
+    msg_string.resize(53, '.');
+    log_printf(RESULT, "%s%1.4E sec", msg_string.c_str(),
+               time_per_integ_total);
+  }
+  else {
+    msg_string = "Integration time by segment-group-device (sweep)";
+    msg_string.resize(53, '.');
+    log_printf(RESULT, "%s%1.4E sec", msg_string.c_str(), time_per_integration
+               / omp_get_max_threads());
+
+    msg_string = "Integration time by segment-group-device (total)";
+    msg_string.resize(53, '.');
+    log_printf(RESULT, "%s%1.4E sec", msg_string.c_str(), time_per_integ_total
+               / omp_get_max_threads());
+  }
 
   /* Print footer with number of tracks, segments and fsrs */
   set_separator_character('-');
@@ -1996,6 +2086,8 @@ void Solver::dumpFSRFluxes(std::string fname) {
   /* Write the FSR fluxes file */
   FILE* out;
   out = fopen(filename.c_str(), "w");
+  if (out == NULL)
+    log_printf(ERROR, "Fluxes file %s could not be written.", &filename[0]);
 
   /* Write k-eff */
   fwrite(&_k_eff, sizeof(double), 1, out);

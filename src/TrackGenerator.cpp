@@ -143,6 +143,15 @@ void TrackGenerator::initializeVolumes() {
   initializeFSRVolumesBuffer();
   FP_PRECISION* fsr_volumes = getFSRVolumes();
 
+  /* Reset cell and material volumes */
+  for (int i=0; i < num_FSRs; i++) {
+    cell = _geometry->findCellContainingFSR(i);
+    cell->setVolume(0);
+
+    material = cell->getFillMaterial();
+    material->setVolume(0);
+  }
+
   /* Compute volume and number of instances for each Cell and Material */
   for (int i=0; i < num_FSRs; i++) {
     cell = _geometry->findCellContainingFSR(i);
@@ -455,7 +464,7 @@ void TrackGenerator::setNumThreads(int num_threads) {
   /* Set the number of threads for OpenMP */
   omp_set_num_threads(_num_threads);
   if (_geometry != NULL)
-    _geometry->reserveKeyStrings(num_threads);
+    _geometry->setNumThreads(num_threads);
 
   /* Print CPU assignments, useful for NUMA where by-socket is the preferred
    * CPU grouping */
@@ -820,7 +829,8 @@ void TrackGenerator::generateTracks() {
     initializeTracks();
 
     /* Initialize the track file directory and read in tracks if they exist */
-    initializeTrackFileDirectory();
+    //NOTE Useful for 2D simulations, currently broken
+    //initializeTrackFileDirectory();
 
     /* If track file not present, generate segments */
     if (_use_input_file == false) {
@@ -867,8 +877,6 @@ void TrackGenerator::generateTracks() {
 #endif
   _timer->stopTimer();
   _timer->recordSplit("Track Generation Time");
-
-  printTimerReport(true);
 }
 
 
@@ -1230,31 +1238,62 @@ void TrackGenerator::segmentize() {
                "TrackGenerators.", min_z, max_z);
 
 #ifdef MPIx
-  /* Check that the geometry is not domain decomposed in Z */
-  int domains_xyz[3];
-  _geometry->getDomainStructure(domains_xyz);
-  if (domains_xyz[2] > 1)
-    log_printf(ERROR, "A geometry with an axial domain domain decomposition "
-               "has been supplied to a 2D ray tracer.");
+    /* Check that the geometry is not domain decomposed in Z */
+    int domains_xyz[3];
+    _geometry->getDomainStructure(domains_xyz);
+    if (domains_xyz[2] > 1)
+      log_printf(ERROR, "A geometry with an axial domain domain decomposition "
+                 "has been supplied to a 2D ray tracer.");
 #endif
 
-    Cmfd* cmfd = _geometry->getCmfd();
-    if (cmfd != NULL) {
-
-      /* Check that CMFD has been initialized */
-      if (cmfd->getLattice() == NULL)
-        log_printf(ERROR, "CMFD has not been initialized before generating "
-                   "tracks. A call to geometry.initializeFlatSourceRegions() "
-                   "may be missing.");
-
-      /* Re-initialize CMFD lattice with 2D dimensions */
-      Point offset;
-      offset.setX(cmfd->getLattice()->getOffset()->getX());
-      offset.setY(cmfd->getLattice()->getOffset()->getY());
-      offset.setZ(_z_coord);
-      cmfd->initializeLattice(&offset, true);
+    /* Check that the track generator is ray tracing within bounds */
+    if (_z_coord < min_z || _z_coord > max_z) {
+      log_printf(WARNING_ONCE, "The track generator z-coordinate (%.2e cm) "
+                 "lies outside the geometry bounds [%.2e %.2e] cm. Z"
+                 "-coordinate moved to %.2e cm", _z_coord, min_z, max_z,
+                 (min_z + max_z) / 2);
+      _z_coord = (min_z + max_z) / 2;
     }
   }
+
+#ifdef MPIx
+  /* If domain decomposed, add artificial infinite Z bounds */
+  if (_geometry->isDomainDecomposed()) {
+    ZPlane* min_z_plane = new ZPlane(-FLT_INFINITY);
+    ZPlane* max_z_plane = new ZPlane(+FLT_INFINITY);
+    min_z_plane->setBoundaryType(REFLECTIVE);
+    max_z_plane->setBoundaryType(REFLECTIVE);
+
+    std::map<int, Cell*>::iterator cell;
+    std::map<int, Cell*> cells = _geometry->getRootUniverse()->getCells();
+    for (cell = cells.begin(); cell != cells.end(); ++cell) {
+      (cell->second)->addSurface(+1, min_z_plane);
+      (cell->second)->addSurface(-1, max_z_plane);
+    }
+    _geometry->getRootUniverse()->calculateBoundaries();
+  }
+#endif
+
+  /* Make sure CMFD lattice is initialized and has right offset for 2D */
+  Cmfd* cmfd = _geometry->getCmfd();
+  if (cmfd != NULL) {
+
+    /* Check that CMFD has been initialized */
+    if (cmfd->getLattice() == NULL)
+      log_printf(ERROR, "CMFD has not been initialized before generating "
+                 "tracks. A call to geometry.initializeFlatSourceRegions() "
+                 "may be missing.");
+
+    /* Re-initialize CMFD lattice with 2D dimensions */
+    Point offset;
+    offset.setX(cmfd->getLattice()->getOffset()->getX());
+    offset.setY(cmfd->getLattice()->getOffset()->getY());
+    offset.setZ(_z_coord);
+    cmfd->initializeLattice(&offset, true);
+  }
+
+  /* FSR numbering can change between two ray tracing */
+  _geometry->resetContainsFSRCentroids();
 
   std::string msg = "Segmenting 2D tracks";
   Progress progress(_num_2D_tracks, msg, 0.1, _geometry, true);
@@ -1361,6 +1400,9 @@ void TrackGenerator::dumpSegmentsToFile() {
 
   FILE* out;
   out = fopen(_tracks_filename.c_str(), "w");
+  if (out == NULL)
+    log_printf(ERROR, "Segments file %s could not be written.",
+               &_tracks_filename[0]);
 
   /* Get a string representation of the Geometry's attributes. This is used to
    * check whether or not ray tracing has been performed for this Geometry */
@@ -1477,6 +1519,9 @@ bool TrackGenerator::readSegmentsFromFile() {
 
   int ret;
   FILE* in = fopen(_tracks_filename.c_str(), "r");
+  if (in == NULL)
+    log_printf(ERROR, "Segments file %s could not be found.",
+               &_tracks_filename[0]);
 
   int string_length;
 
@@ -1664,12 +1709,18 @@ void TrackGenerator::generateFSRCentroids(FP_PRECISION* FSR_volumes) {
 
   /* Print FSR volumes, centroids and volume moments for debugging purposes */
   double total_volume[4];
-  memset(&total_volume[0], 0, 4 * sizeof(double));
+  memset(total_volume, 0, 4 * sizeof(double));
+  FP_PRECISION min_volume = 1e10;
+  FP_PRECISION max_volume = 0.;
+
   for (long r=0; r < num_FSRs; r++) {
     total_volume[0] += _FSR_volumes[r];
     total_volume[1] += _FSR_volumes[r] * centroids[r]->getX();
     total_volume[2] += _FSR_volumes[r] * centroids[r]->getY();
     total_volume[3] += _FSR_volumes[r] * centroids[r]->getZ();
+
+    min_volume = std::min(_FSR_volumes[r], min_volume);
+    max_volume = std::max(_FSR_volumes[r], max_volume);
 
     log_printf(DEBUG, "FSR ID = %d has volume = %.6f, centroid"
                " (%.3f %.3f %.3f)", r, _FSR_volumes[r], centroids[r]->getX(),
@@ -1679,6 +1730,8 @@ void TrackGenerator::generateFSRCentroids(FP_PRECISION* FSR_volumes) {
   log_printf(DEBUG, "Total volume %.6f cm3, moments of volume "
              "(%.4e %.4e %.4e).", total_volume[0], total_volume[1],
              total_volume[2], total_volume[3]);
+  log_printf(DEBUG, "Average / min / max volumes of FSRs : %.2e / %.2e / %.2e",
+             total_volume[0] / num_FSRs, min_volume, max_volume);
   delete [] centroids;
 }
 

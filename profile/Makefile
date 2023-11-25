@@ -140,7 +140,12 @@ ifeq ($(DEBUG),yes)
   CFLAGS += -g
   CFLAGS += -fno-omit-frame-pointer
 else
-  CFLAGS += -Wno-unused-result
+  ifeq ($(COMPILER),gnu)
+    CFLAGS += -Wno-unused-result
+  endif
+  ifeq ($(COMPILER),mpi)
+    CFLAGS += -Wno-unused-result
+  endif
 endif
 
 # Profiling Flags
@@ -170,8 +175,13 @@ ifeq ($(CMFD_PRECISION),double)
 endif
 
 # Vector Flags, take into account strip mining with VEC_LENGTH sized vectors
-CFLAGS += -DVEC_LENGTH=32
-CFLAGS += -DVEC_ALIGNMENT=32
+CFLAGS += -DVEC_ALIGNMENT=64
+ifeq ($(PRECISION),single)
+  CFLAGS += -DVEC_LENGTH=8
+endif
+ifeq ($(PRECISION),double)
+  CFLAGS += -DVEC_LENGTH=4
+endif
 
 # Optimization Flags
 ifeq ($(OPTIMIZE),yes)

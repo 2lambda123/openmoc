@@ -108,6 +108,9 @@ void Matrix::incrementValue(int cell_from, int group_from,
 
   /* Release Matrix cell mutual exclusion lock */
   omp_unset_lock(&_cell_locks[cell_to]);
+#ifdef INTEL
+#pragma omp flush
+#endif
 
   /* Set global modified flag to true */
   _modified = true;
@@ -153,6 +156,9 @@ void Matrix::setValue(int cell_from, int group_from,
 
   /* Release Matrix cell mutual exclusion lock */
   omp_unset_lock(&_cell_locks[cell_to]);
+#ifdef INTEL
+#pragma omp flush
+#endif
 
   /* Set global modified flag to true */
   _modified = true;
@@ -207,7 +213,7 @@ void Matrix::convertToCSR() {
   for (int row=0; row < _num_rows; row++) {
     _IA[row] = j;
     for (iter = _LIL[row].begin(); iter != _LIL[row].end(); ++iter) {
-      if (fabs(iter->second) > FLT_EPSILON) {
+      if (fabs(iter->second) > 0) {
         _JA[j] = iter->first;
         _A[j] = iter->second;
 

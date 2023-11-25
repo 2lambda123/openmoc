@@ -9,7 +9,10 @@ import glob
 import pickle
 from collections import OrderedDict
 from optparse import OptionParser
-from PIL import Image, ImageOps
+try:
+    from PIL import Image, ImageOps
+except ImportError as error:
+    print(error.__class__.__name__ + ": " + str(error))
 
 sys.path.insert(0, 'openmoc')
 import openmoc
@@ -99,25 +102,45 @@ class TestHarness(object):
 
     def _execute_test(self):
         """Build geometry, ray trace, run calculation, and verify results."""
+
+        # If running the test suite with MPI, only rank 0 should check the result
+        try:
+            from mpi4py import MPI
+            rank = MPI.COMM_WORLD.Get_rank()
+        except:
+            rank = 0
+
         try:
             self._setup()
             self._run_openmoc()
             results = self._get_results()
-            self._write_results(results)
-            self._compare_results()
+            if rank == 0:
+                self._write_results(results)
+                self._compare_results()
         finally:
-            self._cleanup()
+            if rank == 0:
+                self._cleanup()
 
     def _update_results(self):
         """Update the results_true using the current version of OpenMOC."""
+
+        # If running the test suite with MPI, only rank 0 should write the result
+        try:
+            from mpi4py import MPI
+            rank = MPI.COMM_WORLD.Get_rank()
+        except:
+            rank = 0
+
         try:
             self._setup()
             self._run_openmoc()
             results = self._get_results()
-            self._write_results(results)
-            self._overwrite_results()
+            if rank == 0:
+                self._write_results(results)
+                self._overwrite_results()
         finally:
-            self._cleanup()
+            if rank == 0:
+                self._cleanup()
 
     def _run_openmoc(self):
         """Run an OpenMOC eigenvalue or fixed source calculation."""
@@ -194,9 +217,9 @@ class TestHarness(object):
 
     def _compare_results(self):
         """Make sure the current results agree with the _true standard."""
-        
+
         # For comparison of files with different line endings
-        compare = (open('results_test.dat', 'r').read() == 
+        compare = (open('results_test.dat', 'r').read() ==
                    open('results_true.dat', 'r').read())
         if not compare:
             os.rename('results_test.dat', 'results_error.dat')
@@ -304,7 +327,7 @@ class PlottingTestHarness(TestHarness):
         return ''
 
     def _write_results(self, results_string):
-        """Do nothing since the plots are created in _run_openmoce() method."""
+        """Do nothing since the plots are created in _run_openmoc() method."""
         return
 
     def _overwrite_results(self):
@@ -317,7 +340,7 @@ class PlottingTestHarness(TestHarness):
         for i in range(len(outputs)):
             shutil.copyfile('test-{0}.png'.format(i), 'true-{0}.png'.format(i))
 
-    def _compare_results(self, max_distance=1.):
+    def _compare_results(self, max_distance=0.1):
         """Make sure the current results agree with the true standard."""
 
         # Loop over each Matplotlib figure / PIL Image and
@@ -357,12 +380,12 @@ class PlottingTestHarness(TestHarness):
         rgba2 = np.array(img2)
 
         # Compute histograms of each images pixels
-        hr1, bins1 = np.histogram(rgba1[...,0], bins=256, normed=True)
-        hg1, bins1 = np.histogram(rgba1[...,1], bins=256, normed=True)
-        hb1, bins1 = np.histogram(rgba1[...,2], bins=256, normed=True)
-        hr2, bins2 = np.histogram(rgba2[...,0], bins=256, normed=True)
-        hg2, bins2 = np.histogram(rgba2[...,1], bins=256, normed=True)
-        hb2, bins2 = np.histogram(rgba2[...,2], bins=256, normed=True)
+        hr1, bins1 = np.histogram(rgba1[...,0], bins=256, density=True)
+        hg1, bins1 = np.histogram(rgba1[...,1], bins=256, density=True)
+        hb1, bins1 = np.histogram(rgba1[...,2], bins=256, density=True)
+        hr2, bins2 = np.histogram(rgba2[...,0], bins=256, density=True)
+        hg2, bins2 = np.histogram(rgba2[...,1], bins=256, density=True)
+        hb2, bins2 = np.histogram(rgba2[...,2], bins=256, density=True)
         hist1 = np.array([hr1, hg1, hb1]).ravel()
         hist2 = np.array([hr2, hg2, hb2]).ravel()
 

@@ -32,6 +32,7 @@ Cmfd::Cmfd() {
   _cell_width_x = 0.;
   _cell_width_y = 0.;
   _cell_width_z = 0.;
+  _num_unbounded_iterations = 0;
   _flux_update_on = true;
   _centroid_update_on = false;
   _use_axial_interpolation = 0;
@@ -47,11 +48,13 @@ Cmfd::Cmfd() {
   _tallies_allocated = false;
   _domain_communicator_allocated = false;
   _linear_source = false;
-  _check_neutron_balance = false;
   _old_dif_surf_valid = false;
-
   _non_uniform = false;
   _widths_adjusted_for_domains = false;
+
+  /* Additional debug output */
+  _check_neutron_balance = false;
+  _print_cmfd_prolongation_ratios = false;
 
   /* Energy group and polar angle problem parameters */
   _num_moc_groups = 0;
@@ -63,6 +66,7 @@ Cmfd::Cmfd() {
   /* Set matrices and arrays to NULL */
   _A = NULL;
   _M = NULL;
+  _moc_iteration = 0;
   _k_eff = 1.0;
   _relaxation_factor = 0.7;
   _old_flux = NULL;
@@ -332,6 +336,15 @@ int Cmfd::getNumY() {
  */
 int Cmfd::getNumZ() {
   return _num_z;
+}
+
+
+/**
+ * @brief Get the number of Mesh cells in the z-direction in the local domain
+ * @return number of Mesh cells in the z-direction in the domain
+ */
+int Cmfd::getLocalNumZ() {
+  return _local_num_z;
 }
 
 
@@ -729,6 +742,25 @@ void Cmfd::collapseXS() {
     communicateSplits(true);
 #endif
 
+  /* Report number of negative currents */
+  long num_negative_currents = _surface_currents->getNumNegativeValues();
+  int total_negative_CMFD_current_domains = (num_negative_currents > 0);
+#ifdef MPIx
+  if (_domain_communicator != NULL) {
+    long temp_sum_neg = num_negative_currents;
+    MPI_Allreduce(&temp_sum_neg, &num_negative_currents, 1, MPI_LONG, MPI_SUM,
+                  _domain_communicator->_MPI_cart);
+    int temp_sum_dom = total_negative_CMFD_current_domains;
+    MPI_Allreduce(&temp_sum_dom, &total_negative_CMFD_current_domains, 1,
+                  MPI_INT, MPI_SUM, _domain_communicator->_MPI_cart);
+  }
+#endif
+
+  if (_SOLVE_3D && num_negative_currents > 0)
+    log_printf(WARNING_ONCE, "Negative CMFD currents in %ld surfaces-groups in"
+               " %d domains.", num_negative_currents,
+               total_negative_CMFD_current_domains);
+
 #pragma omp parallel
   {
 
@@ -784,7 +816,7 @@ void Cmfd::collapseXS() {
       }
 
       /* Set chi */
-      if (fabs(neutron_production_tally) > FLT_EPSILON) {
+      if (fabs(neutron_production_tally) > 0) {
 
         /* Calculate group-wise fission contributions */
         for (int e=0; e < _num_cmfd_groups; e++)
@@ -862,11 +894,25 @@ void Cmfd::collapseXS() {
         double rxn_tally = _reaction_tally[i][e];
 
         if (rxn_tally <= 0) {
+          int cell = getGlobalCMFDCell(i);
+          int x = (cell % (_num_x * _num_y)) % _num_x;
+          int y = (cell % (_num_x * _num_y)) / _num_x;
+          int z = cell / (_num_x * _num_y);
           log_printf(WARNING, "Negative or zero reaction tally calculated in "
-                     "CMFD cell %d in CMFD group %d : %e", i, e + 1, rxn_tally);
+                     "CMFD cell %d [%d %d %d] in CMFD group %d : %e", cell, x,
+                     y, z, e + 1, rxn_tally);
+
+          /* Set all cross sections to be 1 */
           rxn_tally = ZERO_SIGMA_T;
           _reaction_tally[i][e] = ZERO_SIGMA_T;
           _diffusion_tally[i][e] = ZERO_SIGMA_T;
+          total_tally = ZERO_SIGMA_T;
+          if (nu_fission_tally != 0)
+            nu_fission_tally = ZERO_SIGMA_T;
+
+          /* Avoid excessive downscatter */
+          for (int g = 0; g < _num_cmfd_groups; g++)
+            scat_tally[g] = 0;
         }
 
         cell_material->setSigmaTByGroup(total_tally / rxn_tally, e + 1);
@@ -958,8 +1004,9 @@ void Cmfd::collapseXS() {
     MPI_Allreduce(&global_max_tau, &max_tau, 1, MPI_FLOAT, MPI_MAX,
                   _domain_communicator->_MPI_cart);
 #endif
-  log_printf(INFO_ONCE, "Max CMFD optical thickness in all domains %.2e",
-             global_max_tau);
+  if (_moc_iteration == 0)
+    log_printf(INFO_ONCE, "Max CMFD optical thickness in all domains %.2e",
+               global_max_tau);
 }
 
 
@@ -995,13 +1042,11 @@ CMFD_PRECISION Cmfd::getDiffusionCoefficient(int cmfd_cell, int group) {
  * @param cmfd_cell A CMFD cell
  * @param surface A surface of the CMFD cell
  * @param group A CMFD energy group
- * @param moc_iteration MOC iteration number
  * @param dif_surf the surface diffusion coefficient \f$ \hat{D} \f$
  * @param dif_surf_corr the correction diffusion coefficient \f$ \tilde{D} \f$
  */
 void Cmfd::getSurfaceDiffusionCoefficient(int cmfd_cell, int surface,
-                                          int group, int moc_iteration,
-                                          CMFD_PRECISION& dif_surf,
+                                          int group, CMFD_PRECISION& dif_surf,
                                           CMFD_PRECISION& dif_surf_corr) {
 
   FP_PRECISION current, current_out, current_in;
@@ -1018,8 +1063,6 @@ void Cmfd::getSurfaceDiffusionCoefficient(int cmfd_cell, int surface,
   CMFD_PRECISION delta_next = 0.0;
   if (global_cmfd_cell_next != -1)
     delta_next = getPerpendicularSurfaceWidth(surface, global_cmfd_cell_next);
-
-  int sense = getSense(surface);
 
   /* Correct the diffusion coefficient with Larsen's effective diffusion
    * coefficient correction factor */
@@ -1040,12 +1083,12 @@ void Cmfd::getSurfaceDiffusionCoefficient(int cmfd_cell, int surface,
     else if (_boundaries[surface] == VACUUM) {
 
       /* Compute the surface-averaged current leaving the cell */
-      current_out = sense * _surface_currents->getValue
+      current_out = _surface_currents->getValue
           (cmfd_cell, surface*_num_cmfd_groups + group) / delta_interface;
 
       /* Set the surface diffusion coefficient and MOC correction */
       dif_surf =  2 * dif_coef / delta / (1 + 4 * dif_coef / delta);
-      dif_surf_corr = (sense * dif_surf * flux - current_out) / flux;
+      dif_surf_corr = (dif_surf * flux - current_out) / flux;
     }
   }
 
@@ -1095,24 +1138,28 @@ void Cmfd::getSurfaceDiffusionCoefficient(int cmfd_cell, int surface,
                / (delta_next * dif_coef + delta * dif_coef_next);
 
     /* Compute the surface-averaged net current across the surface */
-    current = sense * (current_out - current_in) / delta_interface;
+    current = (current_out - current_in) / delta_interface;
 
     /* Compute the surface diffusion coefficient correction */
-    dif_surf_corr = -(sense * dif_surf * (flux_next - flux) + current)
+    dif_surf_corr = -(dif_surf * (flux_next - flux) + current)
         / (flux_next + flux);
 
     /* Flux limiting condition */
-    if (_flux_limiting && moc_iteration > 0) {
+    if (_flux_limiting && _moc_iteration > 0) {
       double ratio = dif_surf_corr / dif_surf;
       if (std::abs(ratio) > 1.0) {
 
-        if (sense * current > 0.0)
+        if (current > 0.0)
           dif_surf = std::abs(current / (2.0*flux));
         else
           dif_surf = std::abs(current / (2.0*flux_next));
 
-        dif_surf_corr = -(sense * dif_surf * (flux_next - flux) + current)
+        dif_surf_corr = -(dif_surf * (flux_next - flux) + current)
                         / (flux_next + flux);
+
+        /* Make sure diffusion coefficient is larger than the corrected one,
+           to floating point precision */
+        dif_surf = std::max(dif_surf, std::abs(dif_surf_corr));
       }
     }
   }
@@ -1127,7 +1174,7 @@ void Cmfd::getSurfaceDiffusionCoefficient(int cmfd_cell, int surface,
 
   /* If it is the first MOC iteration, solve the straight diffusion problem
    * with no MOC correction */
-  if (moc_iteration == 0 && !_check_neutron_balance)
+  if (_moc_iteration == 0 && !_check_neutron_balance)
     dif_surf_corr = 0.0;
 }
 
@@ -1148,6 +1195,9 @@ double Cmfd::computeKeff(int moc_iteration) {
 
   /* Start recording total CMFD time */
   _timer->startTimer();
+
+  /* Save MOC iteration number */
+  _moc_iteration = moc_iteration;
 
   /* Create matrix and vector objects */
   if (_A == NULL) {
@@ -1171,7 +1221,7 @@ double Cmfd::computeKeff(int moc_iteration) {
 
   /* Construct matrices and record time */
   _timer->startTimer();
-  constructMatrices(moc_iteration);
+  constructMatrices();
   _timer->stopTimer();
   _timer->recordSplit("Matrix construction time");
 
@@ -1236,6 +1286,10 @@ double Cmfd::computeKeff(int moc_iteration) {
   _timer->stopTimer();
   _timer->recordSplit("Total CMFD time");
 
+  /* If debugging, print CMFD prolongation factors */
+  if (get_log_level() == DEBUG || _print_cmfd_prolongation_ratios)
+    printProlongationFactors();
+
   return _k_eff;
 }
 
@@ -1267,6 +1321,24 @@ void Cmfd::rescaleFlux() {
 #endif
   _new_flux->scaleByValue(1.0 / new_source_sum);
   _old_flux->scaleByValue(1.0 / old_source_sum);
+
+  /* Check for negative fluxes in CMFD flux */
+  long num_negative_fluxes = _new_flux->getNumNegativeValues();
+  int total_negative_CMFD_flux_domains = (num_negative_fluxes > 0);
+#ifdef MPIx
+  if (_domain_communicator != NULL) {
+    long temp_sum_neg = num_negative_fluxes;
+    MPI_Allreduce(&temp_sum_neg, &num_negative_fluxes, 1, MPI_LONG, MPI_SUM,
+                  _domain_communicator->_MPI_cart);
+    int temp_sum_dom = total_negative_CMFD_flux_domains;
+    MPI_Allreduce(&temp_sum_dom, &total_negative_CMFD_flux_domains, 1,
+                  MPI_INT, MPI_SUM, _domain_communicator->_MPI_cart);
+  }
+#endif
+
+  if (num_negative_fluxes > 0)
+    log_printf(WARNING_ONCE, "Negative CMFD fluxes in %ld cells on %d domains.",
+               num_negative_fluxes, total_negative_CMFD_flux_domains);
 }
 
 
@@ -1278,7 +1350,7 @@ void Cmfd::rescaleFlux() {
  *          appropriate positions in the loss + streaming matrix and
  *          fission gain matrix.
  */
-void Cmfd::constructMatrices(int moc_iteration) {
+void Cmfd::constructMatrices() {
 
   log_printf(INFO, "Constructing matrices...");
 
@@ -1374,23 +1446,21 @@ void Cmfd::constructMatrices(int moc_iteration) {
         /* Streaming to neighboring cells */
         for (int s = 0; s < NUM_FACES; s++) {
 
-          sense = getSense(s);
           delta = getSurfaceWidth(s, global_ind);
 
           /* Set transport term on diagonal */
-          getSurfaceDiffusionCoefficient(i, s, e, moc_iteration, dif_surf,
-                                          dif_surf_corr);
+          getSurfaceDiffusionCoefficient(i, s, e, dif_surf, dif_surf_corr);
 
           /* Record the corrected diffusion coefficient */
           _old_dif_surf_corr->setValue(i, s*_num_cmfd_groups+e, dif_surf_corr);
 
           /* Set the diagonal term */
-          value = (dif_surf - sense * dif_surf_corr) * delta;
+          value = (dif_surf - dif_surf_corr) * delta;
           _A->incrementValue(i, e, i, e, value);
 
           /* Set the off diagonal term */
           if (getCellNext(i, s, false, false) != -1) {
-            value = - (dif_surf + sense * dif_surf_corr) * delta;
+            value = - (dif_surf + dif_surf_corr) * delta;
             _A->incrementValue(getCellNext(i, s, false, false), e, i, e, value);
           }
 
@@ -1403,7 +1473,7 @@ void Cmfd::constructMatrices(int moc_iteration) {
                 //FIXME Make num_connections, indexes and domains array not
                 // group dependent
                 int idx = _domain_communicator->num_connections[color][row];
-                value = - (dif_surf + sense * dif_surf_corr) * delta;
+                value = - (dif_surf + dif_surf_corr) * delta;
                 _domain_communicator->indexes[color][row][idx] = neighbor_cell;
                 _domain_communicator->domains[color][row][idx] = s;
                 _domain_communicator->coupling_coeffs[color][row][idx] = value;
@@ -1461,11 +1531,14 @@ void Cmfd::updateMOCFlux() {
         /* Get the update ratio */
         CMFD_PRECISION update_ratio = getUpdateRatio(i, e, *iter);
 
-        /* Limit the update ratio */
-        if (update_ratio > 20.0)
-          update_ratio = 20.0;
-        if (update_ratio < 0.05)
-          update_ratio = 0.05;
+        /* Limit the update ratio for stability purposes. For very low flux
+           regions, update ratio may be left unrestricted a few iterations*/
+        if (_moc_iteration > _num_unbounded_iterations) {
+          if (update_ratio > 20.0)
+            update_ratio = 20.0;
+          else if (update_ratio < 0.05)
+            update_ratio = 0.05;
+        }
 
         /* Save max update ratio among fsrs and groups in a cell */
         if (_convergence_data != NULL)
@@ -1657,6 +1730,14 @@ void Cmfd::setCMFDRelaxationFactor(double relaxation_factor) {
  */
 void Cmfd::checkBalance() {
   _check_neutron_balance = true;
+}
+
+
+/**
+ * @brief Print the CMFD prolongation factors at every iteration.
+ */
+void Cmfd::printProlongation() {
+  _print_cmfd_prolongation_ratios = true;
 }
 
 
@@ -2697,8 +2778,8 @@ void Cmfd::enforceBalanceOnDiagonal(int cmfd_cell, int group) {
         _FSR_sources[fsr_id * _num_moc_groups + h];
   }
 
-  if (fabs(moc_source) < FLT_EPSILON)
-    moc_source = 1e-20;
+  if (fabs(moc_source) < FLUX_EPSILON)
+    moc_source = FLUX_EPSILON;
 
   /* Compute updated value */
   double flux = _old_flux->getValue(cmfd_cell, group);
@@ -3178,12 +3259,12 @@ CMFD_PRECISION Cmfd::getFluxRatio(int cell_id, int group, long fsr) {
            interpolants[1] * new_flux_mid +
            interpolants[2] * new_flux_next;
 
-    if (fabs(old_flux) > FLT_EPSILON)
+    if (fabs(old_flux) > FLUX_EPSILON)
       ratio = new_flux / old_flux;
 
     /* Fallback: using the cell average flux ratio */
     if (ratio < 0) {
-      if (fabs(_old_flux->getValue(cell_id, group)) > FLT_EPSILON)
+      if (fabs(_old_flux->getValue(cell_id, group)) > FLUX_EPSILON)
         ratio = _new_flux->getValue(cell_id, group) /
                 _old_flux->getValue(cell_id, group);
       else
@@ -3193,7 +3274,7 @@ CMFD_PRECISION Cmfd::getFluxRatio(int cell_id, int group, long fsr) {
     return ratio;
   }
   else {
-    if (fabs(_old_flux->getValue(cell_id, group)) > FLT_EPSILON)
+    if (fabs(_old_flux->getValue(cell_id, group)) > FLUX_EPSILON)
       return _new_flux->getValue(cell_id, group) /
               _old_flux->getValue(cell_id, group);
     else
@@ -3315,6 +3396,16 @@ double Cmfd::getDistanceToCentroid(Point* centroid, int cell_id,
  */
 void Cmfd::setGeometry(Geometry* geometry) {
   _geometry = geometry;
+}
+
+
+/**
+ * @brief Set the number of iterations where the CMFD update ratios are not
+ *        bounded.
+ * @param unbounded number of iterations without bounds on CMFD update ratios
+ */
+void Cmfd::setNumUnboundedIterations(int unbounded_iterations) {
+  _num_unbounded_iterations = unbounded_iterations;
 }
 
 
@@ -3859,17 +3950,17 @@ void Cmfd::initializeLattice(Point* offset, bool is_2D) {
     _accumulate_z[i+1] = _accumulate_z[i] + _cell_widths_z[i];
 
   if (fabs(_width_x - _accumulate_x[_num_x]) > FLT_EPSILON ||
-     fabs(_width_y - _accumulate_y[_num_y]) > FLT_EPSILON ||
-     fabs(_width_z - _accumulate_z[_num_z]) > FLT_EPSILON)
+      fabs(_width_y - _accumulate_y[_num_y]) > FLT_EPSILON ||
+      fabs(_width_z - _accumulate_z[_num_z]) > FLT_EPSILON)
     log_printf(ERROR, "The sum of non-uniform mesh widths are not consistent "
-      "with geometry dimensions. width_x = %20.17E, width_y = %20.17E, "
-      "width_z = %20.17E, sum_x = %20.17E, sum_y = %20.17E, sum_z = %20.17E, "
-      "diff_x = %20.17E, diff_y = %20.17E, diff_z = %20.17E, FLT_EPSILON = "
-      "%20.17E", _width_x, _width_y, _width_z, _accumulate_x[_num_x],
-      _accumulate_y[_num_y], _accumulate_z[_num_z],
-      fabs(_width_x - _accumulate_x[_num_x]),
-      fabs(_width_y - _accumulate_y[_num_y]),
-      fabs(_width_z - _accumulate_z[_num_z]), FLT_EPSILON);
+               "with geometry dimensions. width_x = %20.17E, width_y = %20.17E"
+               ", width_z = %20.17E, sum_x = %20.17E, sum_y = %20.17E, sum_z ="
+               " %20.17E, diff_x = %20.17E, diff_y = %20.17E, diff_z = %20.17E"
+               ", FLT_EPSILON = %20.17E", _width_x, _width_y, _width_z,
+               _accumulate_x[_num_x], _accumulate_y[_num_y],
+               _accumulate_z[_num_z], fabs(_width_x - _accumulate_x[_num_x]),
+               fabs(_width_y - _accumulate_y[_num_y]),
+               fabs(_width_z - _accumulate_z[_num_z]), FLT_EPSILON);
 
   /* Delete old lattice if it exists */
   if (_lattice != NULL)
@@ -4238,40 +4329,45 @@ void Cmfd::printInputParamsSummary() {
   else
     log_printf(NORMAL, "CMFD acceleration: OFF (no MOC flux update)");
 
-  // Print CMFD relaxation information
-  if (std::abs(_SOR_factor - 1) > FLT_EPSILON)
-    log_printf(NORMAL, "CMFD inner linear solver SOR factor: %f", _SOR_factor);
-  log_printf(NORMAL, "CMFD corrected diffusion coef. relaxation factor: %f",
-             _relaxation_factor);
+  if (_flux_update_on) {
+    // Print CMFD relaxation information
+    if (std::abs(_SOR_factor - 1) > FLT_EPSILON)
+      log_printf(NORMAL, "CMFD inner linear solver SOR factor: %f",
+                 _SOR_factor);
+    log_printf(NORMAL, "CMFD corrected diffusion coef. relaxation factor: %f",
+               _relaxation_factor);
 
-  // Print CMFD interpolation techniques
-  if (_centroid_update_on)
-    log_printf(NORMAL, "CMFD K-nearest scheme: %d neighbors", _k_nearest);
-  if (_use_axial_interpolation == 1)
-    log_printf(NORMAL, "CMFD axial interpolation with axially averaged update "
-               "ratios");
-  else if (_use_axial_interpolation == 2)
-    log_printf(NORMAL, "CMFD axial interpolation with update ratios evaluated "
-               "at centroid Z-coordinate");
+    // Print CMFD interpolation techniques
+    if (_centroid_update_on)
+      log_printf(NORMAL, "CMFD K-nearest scheme: %d neighbors", _k_nearest);
+    if (_use_axial_interpolation == 1)
+      log_printf(NORMAL, "CMFD axial interpolation with axially averaged "
+                 "update ratios");
+    else if (_use_axial_interpolation == 2)
+      log_printf(NORMAL, "CMFD axial interpolation with update ratios evaluated"
+                 " at centroid Z-coordinate");
 
-  // Print other CMFD modifications
-  if (_flux_limiting)
-    log_printf(INFO_ONCE, "CMFD corrected diffusion coef. bounded by "
-               "regular diffusion coef.");
-  if (_balance_sigma_t)
-    log_printf(INFO_ONCE, "CMFD total cross sections adjusted for matching MOC "
-               "reaction rates");
+    // Print other CMFD modifications
+    if (_flux_limiting)
+      log_printf(INFO_ONCE, "CMFD corrected diffusion coef. bounded by "
+                 "regular diffusion coef.");
+    if (_balance_sigma_t)
+      log_printf(INFO_ONCE, "CMFD total cross sections adjusted for matching "
+                 "MOC reaction rates");
+  }
 
   // Print CMFD space and energy mesh information
   log_printf(NORMAL, "CMFD Mesh: %d x %d x %d", _num_x, _num_y, _num_z);
-  if (_num_cmfd_groups != _num_moc_groups) {
-    log_printf(NORMAL, "CMFD Group Structure:");
-    log_printf(NORMAL, "\t MOC Group \t CMFD Group");
-    for (int g=0; g < _num_moc_groups; g++)
-      log_printf(NORMAL, "\t %d \t\t %d", g+1, getCmfdGroup(g)+1);
+  if (_flux_update_on) {
+    if (_num_cmfd_groups != _num_moc_groups) {
+      log_printf(NORMAL, "CMFD Group Structure:");
+      log_printf(NORMAL, "\t MOC Group \t CMFD Group");
+      for (int g=0; g < _num_moc_groups; g++)
+        log_printf(NORMAL, "\t %d \t\t %d", g+1, getCmfdGroup(g)+1);
+    }
+    else
+      log_printf(NORMAL, "CMFD and MOC group structures match");
   }
-  else
-    log_printf(NORMAL, "CMFD and MOC group structures match");
 }
 
 
@@ -4300,11 +4396,13 @@ void Cmfd::printTimerReport() {
   msg_string.resize(53, '.');
   log_printf(RESULT, "%s%1.4E sec", msg_string.c_str(), matrix_construction_time);
 
+#ifdef MPIx
   /* Get the MPI communication time */
   double comm_time = _timer->getSplit("CMFD MPI communication time");
   msg_string = "    MPI communication time";
   msg_string.resize(53, '.');
   log_printf(RESULT, "%s%1.4E sec", msg_string.c_str(), comm_time);
+#endif
 
   /* Get the total solver time */
   double solver_time = _timer->getSplit("Total solver time");
@@ -4717,16 +4815,16 @@ void Cmfd::checkNeutronBalance(bool pre_split, bool moc_balance) {
   int y = (max_imbalance_cell % (_local_num_x * _local_num_y)) / _local_num_x;
   int z = max_imbalance_cell / (_local_num_x * _local_num_y);
   if (moc_balance) {
-    log_printf(NODAL, "Maximum neutron imbalance MOC %f (CMFD %f) at cell %i "
-               "(%d %d %d) and group %d.", max_imbalance_moc,
+    log_printf(NODAL, "Maximum neutron imbalance MOC %.2e (CMFD %.2e) at cell "
+               "%i (%d %d %d) and group %d.", max_imbalance_moc,
                max_imbalance_cmfd, max_imbalance_cell, x, y, z,
                max_imbalance_grp);
     log_printf(NODAL, "%d CMFD cells report a MOC neutron imbalance",
                num_imbalanced);
   }
   else {
-    log_printf(NODAL, "Maximum neutron imbalance between MOC and CMFD : %f "
-               "(MOC %f CMFD %f) at cell %i (%d %d %d) and group %d.",
+    log_printf(NODAL, "Maximum neutron imbalance between MOC and CMFD : %.2e "
+               "(MOC %.2e CMFD %.2e) at cell %i (%d %d %d) and group %d.",
                max_imbalance_moc - max_imbalance_cmfd, max_imbalance_moc,
                max_imbalance_cmfd, max_imbalance_cell, x, y, z,
                max_imbalance_grp);
@@ -5007,7 +5105,7 @@ void Cmfd::unpackSplitCurrents(bool faces) {
                     _received_split_currents[s][idx][f * _num_cmfd_groups + g];
 
                   /* Treat nonzero values */
-                  if (fabs(value) > FLT_EPSILON)
+                  if (fabs(value) > FLUX_EPSILON)
                     _surface_currents->incrementValue(cell_id,
                                                       f * _num_cmfd_groups + g,
                                                       value);
@@ -5029,7 +5127,7 @@ void Cmfd::unpackSplitCurrents(bool faces) {
                     _received_split_currents[s][idx][e * _num_cmfd_groups + g];
 
                   /* Treat nonzero values */
-                  if (fabs(value) > FLT_EPSILON) {
+                  if (fabs(value) > FLUX_EPSILON) {
 
                     int new_ind = surf_idx + g;
 
@@ -5231,13 +5329,13 @@ std::string Cmfd::getSurfaceNameFromSurface(int surface) {
 /**
  * @brief A debugging tool that prints all prolongation factors to file
  */
-void Cmfd::printProlongationFactors(int iteration) {
+void Cmfd::printProlongationFactors() {
 
   /* Loop over CMFD groups */
   for (int e = 0; e < _num_cmfd_groups; e++) {
 
     /* Create arrays for spatial data */
-    double log_ratios[_num_x * _num_y * _num_z];
+    CMFD_PRECISION log_ratios[_num_x * _num_y * _num_z];
     for (int i = 0; i < _num_x * _num_y * _num_z; i++)
       log_ratios[i] = 0.0;
     for (int i = 0; i < _local_num_x * _local_num_y * _local_num_z; i++) {
@@ -5250,17 +5348,25 @@ void Cmfd::printProlongationFactors(int iteration) {
 
 #ifdef MPIx
     if (_geometry->isDomainDecomposed()) {
-      double temp_log_ratios[_num_x * _num_y * _num_z];
+      CMFD_PRECISION temp_log_ratios[_num_x * _num_y * _num_z];
+
+      /* Select appropriate floating point size for transfer */
+      MPI_Datatype mpi_precision;
+      if (sizeof(CMFD_PRECISION) == 4)
+        mpi_precision = MPI_FLOAT;
+      else
+        mpi_precision = MPI_DOUBLE;
+
       for (int i = 0; i < _num_x * _num_y * _num_z; i++)
         temp_log_ratios[i] = log_ratios[i];
       MPI_Allreduce(temp_log_ratios, log_ratios, _num_x * _num_y * _num_z,
-                    MPI_DOUBLE, MPI_SUM, _geometry->getMPICart());
+                    mpi_precision, MPI_SUM, _geometry->getMPICart());
     }
 #endif
 
     /* Print prolongation factors distribution to file */
     if (_geometry->isRootDomain()) {
-      long long iter = iteration;
+      long long iter = _moc_iteration;
       long long group = e;
       std::string fname = "pf_group_";
       std::string group_num = std::to_string(group);
@@ -5310,7 +5416,7 @@ void Cmfd::tallyStartingCurrent(Point* point, double delta_x, double delta_y,
   /* Check for non-zero current */
   bool non_zero = false;
   for (int e=0; e < _num_moc_groups; e++) {
-    if (fabs(track_flux[e]) > FLT_EPSILON) {
+    if (fabs(track_flux[e]) > 0) {
       non_zero = true;
       break;
     }
@@ -5352,7 +5458,7 @@ void Cmfd::tallyStartingCurrent(Point* point, double delta_x, double delta_y,
 
   CMFD_PRECISION currents[_num_cmfd_groups]
        __attribute__ ((aligned(VEC_ALIGNMENT)));
-  memset(&currents[0], 0, _num_cmfd_groups * sizeof(CMFD_PRECISION));
+  memset(currents, 0, _num_cmfd_groups * sizeof(CMFD_PRECISION));
 
   /* Tally currents to each CMFD group locally */
   for (int e=0; e < _num_moc_groups; e++) {
@@ -5509,4 +5615,20 @@ void Cmfd::printCmfdCellSizes() {
   for (i=0; i<_num_z+1; i++)
     printf("i=%d, %f; ",i, _accumulate_z[i]);
   printf("\n");
+}
+
+
+/**
+ * @brief Create a string with information about the CMFD solver.
+ * @details For pretty printing in Python API
+ */
+std::string Cmfd::toString() {
+
+  std::stringstream message;
+  message << "CMFD acceleration at " << (void*)this << std::endl;
+  message << "Mesh in XYZ: [" << _num_x << ", " << _num_y << ", " << _num_z;
+  message << "]" << std::endl;
+  message << "Condensing " << _num_moc_groups << " MOC groups to " <<
+             _num_cmfd_groups << " CMFD groups";
+  return message.str();
 }

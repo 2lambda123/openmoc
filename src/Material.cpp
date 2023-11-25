@@ -570,7 +570,7 @@ void Material::setNumEnergyGroups(const int num_groups) {
   /* Data is not vector aligned */
   else {
     if (_sigma_t != NULL)
-      delete [] _sigma_t;
+      free(_sigma_t);
 
     if (_sigma_s != NULL)
       delete [] _sigma_s;
@@ -586,8 +586,8 @@ void Material::setNumEnergyGroups(const int num_groups) {
   }
 
   /* Allocate memory for data arrays */
-  _sigma_t = (FP_PRECISION*) memalign(VEC_ALIGNMENT,
-                                      _num_groups*sizeof(FP_PRECISION));
+  _sigma_t = (FP_PRECISION*) MM_MALLOC(_num_groups*sizeof(FP_PRECISION),
+                                       VEC_ALIGNMENT);
   _sigma_f = new FP_PRECISION[_num_groups];
   _nu_sigma_f = new FP_PRECISION[_num_groups];
   _chi = new FP_PRECISION[_num_groups];
@@ -721,7 +721,7 @@ void Material::setSigmaTByGroup(double xs, int group) {
 void Material::setSigmaS(double* xs, int num_groups_squared) {
 
   if (_num_groups*_num_groups != num_groups_squared)
-    log_printf(ERROR, "Unable to set sigma_s with %f groups for Material %d "
+    log_printf(ERROR, "Unable to set sigma_s with %.4e groups for Material %d "
                "which contains %d energy groups",
                 float(sqrt(num_groups_squared)), _id, _num_groups);
 
@@ -740,7 +740,7 @@ void Material::setSigmaS(double* xs, int num_groups_squared) {
  */
 void Material::setSigmaSByGroup(double xs, int origin, int destination) {
 
-  if (origin <= 0 || destination <= 0 || origin > _num_groups || 
+  if (origin <= 0 || destination <= 0 || origin > _num_groups ||
       destination > _num_groups)
     log_printf(ERROR, "Unable to set sigma_s for group %d -> %d for Material %d"
                " which contains %d energy groups",
@@ -1121,6 +1121,8 @@ Material* Material::clone() {
     clone->setSigmaFByGroup((double)_sigma_f[i], i+1);
     clone->setNuSigmaFByGroup((double)_nu_sigma_f[i], i+1);
     clone->setChiByGroup((double)_chi[i], i+1);
+    if (_sigma_a != NULL)
+      clone->setSigmaAByGroup((double)_sigma_a[i], i+1);
 
     for (int j=0; j < _num_groups; j++)
       clone->setSigmaSByGroup((double)getSigmaSByGroup(i+1,j+1), i+1, j+1);

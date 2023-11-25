@@ -274,7 +274,7 @@ void set_log_level(const char* new_level) {
  * @brief Sets the minimum log message level which will be printed to the
  *        console and to the log file. This is an overloaded version to handle 
  *        a logLevel type input.
- * @param new_level the minimum logging level as an int(or enum type logLevel)
+ * @param new_level the minimum logging level as an int (or enum type logLevel)
  */
 void set_log_level(int new_level) {
   log_level = (logLevel)new_level;
@@ -585,7 +585,6 @@ void log_printf(logLevel level, const char* format, ...) {
     log_file.close();
 
     /* Write the log message to the shell */
-    //FIXME Too much output tends to segfault, locking output blocks test suite
     if (level == ERROR) {
       omp_set_lock(&log_error_lock);
 #ifdef MPIx
@@ -600,9 +599,14 @@ void log_printf(logLevel level, const char* format, ...) {
       throw std::logic_error(&msg_string[0]);
     }
     else {
+     //Note lock output in Python build for thread safety
+#ifdef SWIG
+      omp_set_lock(&log_error_lock);
+#endif
       printf("%s", &msg_string[0]);
-#ifndef SWIG
       fflush(stdout);
+#ifdef SWIG
+      omp_unset_lock(&log_error_lock);
 #endif
     }
   }

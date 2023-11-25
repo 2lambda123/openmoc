@@ -61,7 +61,7 @@ void CPULSSolver::initializeFluxArrays() {
 
   try {
     /* Allocate an array for the FSR scalar flux */
-    long size = _num_FSRs * _num_groups * 3;
+    long size = _num_FSRs * _NUM_GROUPS * 3;
     long max_size = size;
 #ifdef MPIX
     if (_geometry->isDomainDecomposed())
@@ -100,7 +100,7 @@ void CPULSSolver::initializeSourceArrays() {
   if (_reduced_sources_xyz != NULL)
     delete [] _reduced_sources_xyz;
 
-  long size = _num_FSRs * _num_groups * 3;
+  long size = _num_FSRs * _NUM_GROUPS * 3;
 
   /* Allocate memory for all source arrays */
   try {
@@ -158,7 +158,7 @@ void CPULSSolver::initializeFixedSources() {
 
   /* Allocate the fixed sources array if not yet allocated */
   if (_fixed_sources_xyz.empty()) {
-    long size = _num_FSRs * _num_groups;
+    long size = _num_FSRs * _NUM_GROUPS;
     _fixed_sources_xyz.resize(size);
     for (long i=0; i<size; i++)
       _fixed_sources_xyz.at(i).resize(3, 0);
@@ -209,9 +209,12 @@ void CPULSSolver::initializeFixedSources() {
     source_z = fsr_iter->second[2];
 
     /* Warn the user if a fixed source has already been assigned to this FSR */
-    if (fabs(_fixed_sources_xyz(fsr_id,group,0) - source_x) > FLT_EPSILON ||
-        fabs(_fixed_sources_xyz(fsr_id,group,1) - source_y) > FLT_EPSILON ||
-        fabs(_fixed_sources_xyz(fsr_id,group,2) - source_z) > FLT_EPSILON)
+    if ((fabs(_fixed_sources_xyz(fsr_id,group,0)) > FLT_EPSILON &&
+         fabs(_fixed_sources_xyz(fsr_id,group,0) - source_x) > FLT_EPSILON) ||
+        (fabs(_fixed_sources_xyz(fsr_id,group,1)) > FLT_EPSILON &&
+         fabs(_fixed_sources_xyz(fsr_id,group,1) - source_y) > FLT_EPSILON) ||
+        (fabs(_fixed_sources_xyz(fsr_id,group,2)) > FLT_EPSILON &&
+         fabs(_fixed_sources_xyz(fsr_id,group,2) - source_z) > FLT_EPSILON))
       log_printf(WARNING, "Overriding fixed linear source %f %f %f in FSR ID=%d"
                  " group %d with %f %f %f", _fixed_sources_xyz(fsr_id,group, 0),
                  _fixed_sources_xyz(fsr_id,group,1),
@@ -262,6 +265,7 @@ void CPULSSolver::setFixedSourceMomentsByCell(Cell* cell, int group,
 
   /* Keep a trace that fixed moments have been provided */
   _fixed_source_moments_on = true;
+  _fixed_sources_initialized = false;
 }
 
 
@@ -277,9 +281,9 @@ void CPULSSolver::setFixedSourceMomentByFSR(long fsr_id, int group,
                                             double src_x, double src_y,
                                             double src_z) {
 
-  if (group <= 0 || group > _num_groups)
+  if (group <= 0 || group > _NUM_GROUPS)
     log_printf(ERROR,"Unable to set fixed source for group %d in "
-               "in a %d energy group problem", group, _num_groups);
+               "in a %d energy group problem", group, _NUM_GROUPS);
 
   if (fsr_id < 0 || fsr_id >= _num_FSRs)
     log_printf(ERROR,"Unable to set fixed source for FSR %d with only "
@@ -295,6 +299,39 @@ void CPULSSolver::setFixedSourceMomentByFSR(long fsr_id, int group,
 
   /* Keep a trace that fixed moments have been provided */
   _fixed_source_moments_on = true;
+  _fixed_sources_initialized = false;
+}
+
+
+/**
+ * @brief Reset all fixed sources and fixed sources moments to 0.
+ */
+void CPULSSolver::resetFixedSources() {
+  CPUSolver::resetFixedSources();
+
+  /* Reset fixed source FSR map */
+  std::map< std::pair<int, int>, std::vector<double> >::iterator fsr_iter;
+  for (fsr_iter = _fix_src_xyz_FSR_map.begin();
+       fsr_iter != _fix_src_xyz_FSR_map.end(); ++fsr_iter) {
+    fsr_iter->second[0] = 0;
+    fsr_iter->second[1] = 0;
+    fsr_iter->second[2] = 0;
+  }
+
+  /* Reset fixed source cell map */
+  std::map< std::pair<Cell*, int>, std::vector<double> >::iterator cell_iter;
+  for (cell_iter = _fix_src_xyz_cell_map.begin();
+       cell_iter != _fix_src_xyz_cell_map.end(); ++cell_iter) {
+    cell_iter->second[0] = 0;
+    cell_iter->second[1] = 0;
+    cell_iter->second[2] = 0;
+  }
+
+  /* Reset array of fixed sources */
+  std::vector<std::vector<double> >::iterator iter;
+  for (iter = _fixed_sources_xyz.begin(); iter != _fixed_sources_xyz.end();
+       iter++)
+    std::fill((*iter).begin(), (*iter).end(), 0.);
 }
 
 
@@ -308,7 +345,7 @@ void CPULSSolver::flattenFSRFluxes(FP_PRECISION value) {
 
 #pragma omp parallel for schedule(static)
   for (long r=0; r < _num_FSRs; r++) {
-    for (int e=0; e < _num_groups; e++) {
+    for (int e=0; e < _NUM_GROUPS; e++) {
       _scalar_flux_xyz(r,e,0) = 0.0;
       _scalar_flux_xyz(r,e,1) = 0.0;
       _scalar_flux_xyz(r,e,2) = 0.0;
@@ -329,7 +366,7 @@ double CPULSSolver::normalizeFluxes() {
 
 #pragma omp parallel for schedule(static)
   for (long r=0; r < _num_FSRs; r++) {
-    for (int e=0; e < _num_groups; e++) {
+    for (int e=0; e < _NUM_GROUPS; e++) {
       _scalar_flux_xyz(r,e,0) *= norm_factor;
       _scalar_flux_xyz(r,e,1) *= norm_factor;
       _scalar_flux_xyz(r,e,2) *= norm_factor;
@@ -367,7 +404,7 @@ void CPULSSolver::computeFSRSources(int iteration) {
       material = _FSR_materials[r];
       sigma_s = material->getSigmaS();
 
-      for (int g=0; g < _num_groups; g++) {
+      for (int g=0; g < _NUM_GROUPS; g++) {
 
         /* Initialize the fission sources to zero */
         double fission_source_x = 0.0;
@@ -377,25 +414,25 @@ void CPULSSolver::computeFSRSources(int iteration) {
         /* Compute fission sources */
         if (material->isFissionable()) {
           FP_PRECISION* fission_sources_x = _groupwise_scratch.at(tid);
-          for (int g_prime=0; g_prime < _num_groups; g_prime++)
+          for (int g_prime=0; g_prime < _NUM_GROUPS; g_prime++)
             fission_sources_x[g_prime] = material->getFissionMatrixByGroup(
                  g_prime+1,g+1) * _scalar_flux_xyz(r,g_prime,0);
           fission_source_x =
-              pairwise_sum<FP_PRECISION>(fission_sources_x, _num_groups);
+              pairwise_sum<FP_PRECISION>(fission_sources_x, _NUM_GROUPS);
 
           FP_PRECISION* fission_sources_y = _groupwise_scratch.at(tid);
-          for (int g_prime=0; g_prime < _num_groups; g_prime++)
+          for (int g_prime=0; g_prime < _NUM_GROUPS; g_prime++)
             fission_sources_y[g_prime] = material->getFissionMatrixByGroup(
                  g_prime+1,g+1) * _scalar_flux_xyz(r,g_prime,1);
           fission_source_y =
-              pairwise_sum<FP_PRECISION>(fission_sources_y, _num_groups);
+              pairwise_sum<FP_PRECISION>(fission_sources_y, _NUM_GROUPS);
 
           FP_PRECISION* fission_sources_z = _groupwise_scratch.at(tid);
-          for (int g_prime=0; g_prime < _num_groups; g_prime++)
+          for (int g_prime=0; g_prime < _NUM_GROUPS; g_prime++)
             fission_sources_z[g_prime] = material->getFissionMatrixByGroup(
                  g_prime+1,g+1) * _scalar_flux_xyz(r,g_prime,2);
           fission_source_z =
-              pairwise_sum<FP_PRECISION>(fission_sources_z, _num_groups);
+              pairwise_sum<FP_PRECISION>(fission_sources_z, _NUM_GROUPS);
 
           fission_source_x /= _k_eff;
           fission_source_y /= _k_eff;
@@ -403,35 +440,35 @@ void CPULSSolver::computeFSRSources(int iteration) {
         }
 
         /* Compute scatter + fission source for group g */
-        int first_scattering_index = g * _num_groups;
+        int first_scattering_index = g * _NUM_GROUPS;
 
         /* Compute scatter sources */
         FP_PRECISION* scatter_sources_x = _groupwise_scratch.at(tid);
-        for (int g_prime=0; g_prime < _num_groups; g_prime++) {
+        for (int g_prime=0; g_prime < _NUM_GROUPS; g_prime++) {
           int idx = first_scattering_index + g_prime;
           scatter_sources_x[g_prime] = sigma_s[idx] *
                _scalar_flux_xyz(r,g_prime,0);
         }
         double scatter_source_x =
-            pairwise_sum<FP_PRECISION>(scatter_sources_x, _num_groups);
+            pairwise_sum<FP_PRECISION>(scatter_sources_x, _NUM_GROUPS);
 
         FP_PRECISION* scatter_sources_y = _groupwise_scratch.at(tid);
-        for (int g_prime=0; g_prime < _num_groups; g_prime++) {
+        for (int g_prime=0; g_prime < _NUM_GROUPS; g_prime++) {
           int idx = first_scattering_index + g_prime;
           scatter_sources_y[g_prime] = sigma_s[idx] *
                _scalar_flux_xyz(r,g_prime,1);
         }
         double scatter_source_y =
-            pairwise_sum<FP_PRECISION>(scatter_sources_y, _num_groups);
+            pairwise_sum<FP_PRECISION>(scatter_sources_y, _NUM_GROUPS);
 
         FP_PRECISION* scatter_sources_z = _groupwise_scratch.at(tid);
-        for (int g_prime=0; g_prime < _num_groups; g_prime++) {
+        for (int g_prime=0; g_prime < _NUM_GROUPS; g_prime++) {
           int idx = first_scattering_index + g_prime;
           scatter_sources_z[g_prime] = sigma_s[idx] *
                _scalar_flux_xyz(r,g_prime,2);
         }
         double scatter_source_z =
-            pairwise_sum<FP_PRECISION>(scatter_sources_z, _num_groups);
+            pairwise_sum<FP_PRECISION>(scatter_sources_z, _NUM_GROUPS);
 
         /* Compute total (scatter + fission) source */
         src_x = scatter_source_x + fission_source_x;
@@ -445,8 +482,8 @@ void CPULSSolver::computeFSRSources(int iteration) {
 
         /* Compute total (scatter+fission) reduced source moments */
         if (_SOLVE_3D) {
-          if (_negative_fluxes_allowed || _reduced_sources(r,g) > 1e-15
-              || iteration > 29) {
+          if (_negative_fluxes_allowed ||
+              _reduced_sources(r,g) > 10 * FLUX_EPSILON || iteration > 29) {
             _reduced_sources_xyz(r,g,0) = ONE_OVER_FOUR_PI / 2 *
                  (_FSR_lin_exp_matrix[r*num_coeffs  ] * src_x +
                   _FSR_lin_exp_matrix[r*num_coeffs+2] * src_y +
@@ -461,14 +498,14 @@ void CPULSSolver::computeFSRSources(int iteration) {
                   _FSR_lin_exp_matrix[r*num_coeffs+5] * src_z);
           }
           else {
-            _reduced_sources_xyz(r,g,0) = 1e-25;
-            _reduced_sources_xyz(r,g,1) = 1e-25;
-            _reduced_sources_xyz(r,g,2) = 1e-25;
+            _reduced_sources_xyz(r,g,0) = 0;
+            _reduced_sources_xyz(r,g,1) = 0;
+            _reduced_sources_xyz(r,g,2) = 0;
           }
         }
         else {
-          if (_negative_fluxes_allowed || _reduced_sources(r,g) > 1e-15
-              || iteration > 29) {
+          if (_negative_fluxes_allowed ||
+              _reduced_sources(r,g) > 10 * FLUX_EPSILON || iteration > 29) {
             _reduced_sources_xyz(r,g,0) = ONE_OVER_FOUR_PI / 2 *
                  (_FSR_lin_exp_matrix[r*num_coeffs  ] * src_x +
                   _FSR_lin_exp_matrix[r*num_coeffs+2] * src_y);
@@ -477,8 +514,8 @@ void CPULSSolver::computeFSRSources(int iteration) {
                   _FSR_lin_exp_matrix[r*num_coeffs+1] * src_y);
           }
           else {
-            _reduced_sources_xyz(r,g,0) = 1e-20;
-            _reduced_sources_xyz(r,g,1) = 1e-20;
+            _reduced_sources_xyz(r,g,0) = 0;
+            _reduced_sources_xyz(r,g,1) = 0;
           }
         }
       }
@@ -523,14 +560,14 @@ void CPULSSolver::tallyLSScalarFlux(segment* curr_segment, int azim_index,
     for (int i=0; i<3; i++)
       center_x2[i] = 2 * position[i] + length * direction[i];
 
-    // Compute the sources
-    FP_PRECISION src_flat[_num_groups]
+    /* Compute the sources */
+    FP_PRECISION src_flat[_NUM_GROUPS]
                  __attribute__ ((aligned(VEC_ALIGNMENT)));
-    FP_PRECISION src_linear[_num_groups]
+    FP_PRECISION src_linear[_NUM_GROUPS]
                  __attribute__ ((aligned(VEC_ALIGNMENT)));
 
 #pragma omp simd aligned(src_flat, src_linear)
-    for (int e=0; e < _num_groups; e++) {
+    for (int e=0; e < _NUM_GROUPS; e++) {
       src_flat[e] = _reduced_sources(fsr_id, e);
       for (int i=0; i<3; i++)
         src_flat[e] += _reduced_sources_xyz(fsr_id, e, i) * center_x2[i];
@@ -539,24 +576,24 @@ void CPULSSolver::tallyLSScalarFlux(segment* curr_segment, int azim_index,
       src_linear[e] += _reduced_sources_xyz(fsr_id, e, 2) * direction[2];
     }
 
-    // Compute the exponential term G, intermediate step to F1, F2, H
-    FP_PRECISION exp_G[_num_groups] __attribute__ ((aligned(VEC_ALIGNMENT)));
-    FP_PRECISION tau[_num_groups] __attribute__ ((aligned(VEC_ALIGNMENT)));
+    /* Compute the exponential term G, intermediate step to F1, F2, H */
+    FP_PRECISION exp_G[_NUM_GROUPS] __attribute__ ((aligned(VEC_ALIGNMENT)));
+    FP_PRECISION tau[_NUM_GROUPS] __attribute__ ((aligned(VEC_ALIGNMENT)));
 
 #pragma omp simd aligned(sigma_t, tau, exp_G)
-    for (int e=0; e < _num_groups; e++) {
+    for (int e=0; e < _NUM_GROUPS; e++) {
       /* Bound tau by 1e-8 to limit error on the F2 term */
-      tau[e] = std::max(FP_PRECISION(1e-8), length * sigma_t[e]);
-      expG_fractional(tau[e], &exp_G[e]);
+      tau[e] = length * sigma_t[e];
+      expG_fractional(std::max(FP_PRECISION(1e-8), tau[e]), &exp_G[e]);
     }
 
-    // Determine number of SIMD vector groups
-    const int num_vector_groups = _num_groups / VEC_LENGTH;
-    const int remainder = _num_groups - num_vector_groups * VEC_LENGTH;
+    /* Determine number of SIMD vector groups */
+    const int num_vector_groups = _NUM_GROUPS / VEC_LENGTH;
 
+    /* Compute the flux attenuation and tally contribution */
     for (int v=0; v < num_vector_groups; v++) {
       int start_vector = v * VEC_LENGTH;
-    // Compute the flux attenuation and tally contribution
+
 #pragma omp simd aligned(tau, src_flat, src_linear, fsr_flux, exp_G, fsr_flux_x\
      , fsr_flux_y, fsr_flux_z)
       for (int e=start_vector; e < start_vector + VEC_LENGTH; e++) {
@@ -570,6 +607,7 @@ void CPULSSolver::tallyLSScalarFlux(segment* curr_segment, int azim_index,
         /* Compute the change in flux across the segment */
         FP_PRECISION delta_psi = (tau[e] * track_flux[e] - length * src_flat[e])
              * exp_F1 - src_linear[e] * length * length * exp_F2;
+
         track_flux[e] -= delta_psi;
 
         /* Increment the fsr scalar flux and scalar flux moments */
@@ -580,10 +618,10 @@ void CPULSSolver::tallyLSScalarFlux(segment* curr_segment, int azim_index,
       }
     }
 
-    // Handle remainder of energy groups
+    /* Handle remainder of energy groups */
 #pragma omp simd aligned(tau, src_flat, src_linear, fsr_flux, exp_G, fsr_flux_x\
      , fsr_flux_y, fsr_flux_z)
-    for (int e=num_vector_groups * VEC_LENGTH; e < _num_groups; e++) {
+    for (int e=num_vector_groups * VEC_LENGTH; e < _NUM_GROUPS; e++) {
 
       /* Compute exponential F1, F2 and H from G */
       FP_PRECISION exp_F1 = 1.f - tau[e]*exp_G[e];
@@ -594,6 +632,7 @@ void CPULSSolver::tallyLSScalarFlux(segment* curr_segment, int azim_index,
       /* Compute the change in flux across the segment */
       FP_PRECISION delta_psi = (tau[e] * track_flux[e] - length * src_flat[e])
            * exp_F1 - src_linear[e] * length * length * exp_F2;
+
       track_flux[e] -= delta_psi;
 
       /* Increment the fsr scalar flux and scalar flux moments */
@@ -605,7 +644,7 @@ void CPULSSolver::tallyLSScalarFlux(segment* curr_segment, int azim_index,
   }
   else {
 //FIXME Implement strip mining for the 2D linear source solver
-    ExpEvaluator* exp_evaluator = _exp_evaluators[azim_index][polar_index];
+    ExpEvaluator* exp_evaluator = _exp_evaluators[azim_index][0];
     const int num_polar_2 = _num_polar / 2;
 
     /* Compute the segment midpoint (with factor 2 for LS) */
@@ -614,65 +653,65 @@ void CPULSSolver::tallyLSScalarFlux(segment* curr_segment, int azim_index,
       center[i] = 2 * position[i] + length * direction[i];
 
     /* Compute tau in advance to simplify attenation loop */
-    FP_PRECISION tau[_num_groups * num_polar_2]
+    FP_PRECISION tau[_NUM_GROUPS * num_polar_2]
                  __attribute__ ((aligned(VEC_ALIGNMENT)));
 
 #pragma omp simd aligned(tau)
-    for (int pe=0; pe < num_polar_2 * _num_groups; pe++)
-      tau[pe] = sigma_t[pe % _num_groups] * length;
+    for (int pe=0; pe < num_polar_2 * _NUM_GROUPS; pe++)
+      tau[pe] = sigma_t[pe % _NUM_GROUPS] * length;
 
     /* Compute exponentials */
-    FP_PRECISION exp_F1[num_polar_2*_num_groups]
+    FP_PRECISION exp_F1[num_polar_2*_NUM_GROUPS]
                  __attribute__ ((aligned(VEC_ALIGNMENT)));
-    FP_PRECISION exp_F2[num_polar_2*_num_groups]
+    FP_PRECISION exp_F2[num_polar_2*_NUM_GROUPS]
                  __attribute__ ((aligned(VEC_ALIGNMENT)));
-    FP_PRECISION exp_H[num_polar_2*_num_groups]
+    FP_PRECISION exp_H[num_polar_2*_NUM_GROUPS]
                  __attribute__ ((aligned(VEC_ALIGNMENT)));
 
 #pragma omp simd aligned(tau, exp_F1, exp_F2, exp_H)
-    for (int pe=0; pe < num_polar_2 * _num_groups; pe++)
-      exp_evaluator->retrieveExponentialComponents(tau[pe], int(pe/_num_groups),
+    for (int pe=0; pe < num_polar_2 * _NUM_GROUPS; pe++)
+      exp_evaluator->retrieveExponentialComponents(tau[pe], int(pe/_NUM_GROUPS),
                                                    &exp_F1[pe], &exp_F2[pe],
                                                    &exp_H[pe]);
 
     /* Compute flat part of the source */
-    FP_PRECISION src_flat[_num_groups]
+    FP_PRECISION src_flat[_NUM_GROUPS]
                  __attribute__ ((aligned(VEC_ALIGNMENT)));
 
 #pragma omp simd aligned(src_flat)
-    for (int e=0; e < _num_groups; e++) {
+    for (int e=0; e < _NUM_GROUPS; e++) {
       src_flat[e] = _reduced_sources(fsr_id, e);
       for (int i=0; i<2; i++)
         src_flat[e] += _reduced_sources_xyz(fsr_id, e, i) * center[i];
     }
 
     /* Compute linear part of the source */
-    FP_PRECISION src_linear[num_polar_2 * _num_groups]
+    FP_PRECISION src_linear[num_polar_2 * _NUM_GROUPS]
                  __attribute__ ((aligned(VEC_ALIGNMENT)));
 
 #pragma omp simd aligned(src_linear)
-    for (int pe=0; pe < num_polar_2 * _num_groups; pe++) {
-      FP_PRECISION sin_the = _quad->getSinThetaInline(azim_index,
-                                                      int(pe/_num_groups));
-      src_linear[pe] = direction[0] * sin_the *
-            _reduced_sources_xyz(fsr_id, pe % _num_groups, 0);
-      src_linear[pe] += direction[1] * sin_the *
-            _reduced_sources_xyz(fsr_id, pe % _num_groups, 1);
+    for (int pe=0; pe < num_polar_2 * _NUM_GROUPS; pe++) {
+      //NOTE sin(theta) term cancels out with F2
+      src_linear[pe] = direction[0] *
+            _reduced_sources_xyz(fsr_id, pe % _NUM_GROUPS, 0);
+      src_linear[pe] += direction[1] *
+            _reduced_sources_xyz(fsr_id, pe % _NUM_GROUPS, 1);
     }
 
     /* Compute attenuation of track angular flux */
-    FP_PRECISION delta_psi[_num_groups * num_polar_2]
+    FP_PRECISION delta_psi[_NUM_GROUPS * num_polar_2]
                  __attribute__ ((aligned(VEC_ALIGNMENT)));
 
 #pragma omp simd aligned(tau, src_flat, src_linear, delta_psi, exp_F1, exp_F2, exp_H)
-    for (int pe=0; pe < num_polar_2 * _num_groups; pe++) {
+    for (int pe=0; pe < num_polar_2 * _NUM_GROUPS; pe++) {
 
-      FP_PRECISION wgt = _quad->getWeightInline(azim_index, int(pe/_num_groups));
+      FP_PRECISION wgt = _quad->getWeightInline(azim_index,
+                                                int(pe/_NUM_GROUPS));
       exp_H[pe] *=  wgt * tau[pe] * length * track_flux[pe];
 
-      // Compute the change in flux across the segment
+      /* Compute the change in flux across the segment */
       delta_psi[pe] = (tau[pe] * track_flux[pe] - length
-            * src_flat[pe % _num_groups]) * exp_F1[pe] - length * length
+            * src_flat[pe % _NUM_GROUPS]) * exp_F1[pe] - length * length
             * src_linear[pe] * exp_F2[pe];
       track_flux[pe] -= delta_psi[pe];
       delta_psi[pe] *= wgt;
@@ -683,18 +722,18 @@ void CPULSSolver::tallyLSScalarFlux(segment* curr_segment, int azim_index,
     for (int p=0; p < num_polar_2; p++) {
 
 #pragma omp simd aligned(fsr_flux, fsr_flux_x, fsr_flux_y)
-      for (int e=0; e < _num_groups; e++) {
+      for (int e=0; e < _NUM_GROUPS; e++) {
 
-        fsr_flux[e] += delta_psi[p*_num_groups + e];
-        fsr_flux_x[e] += exp_H[p*_num_groups + e] * direction[0] +
-                                    delta_psi[p*_num_groups + e] * position[0];
-        fsr_flux_y[e] += exp_H[p*_num_groups + e] * direction[1] +
-                                    delta_psi[p*_num_groups + e] * position[1];
+        fsr_flux[e] += delta_psi[p*_NUM_GROUPS + e];
+        fsr_flux_x[e] += exp_H[p*_NUM_GROUPS + e] * direction[0] +
+                                    delta_psi[p*_NUM_GROUPS + e] * position[0];
+        fsr_flux_y[e] += exp_H[p*_NUM_GROUPS + e] * direction[1] +
+                                    delta_psi[p*_NUM_GROUPS + e] * position[1];
       }
     }
   }
 
-  /* Advance starting position for the next segment on this track */
+  /* Move starting position to the end of segment for the opposite direction */
   for (int i=0; i < 3; i++)
     position[i] += direction[i] * length;
 }
@@ -712,18 +751,19 @@ void CPULSSolver::accumulateLinearFluxContribution(long fsr_id,
                                                    FP_PRECISION* __restrict__
                                                    fsr_flux) {
 
-  int num_groups_aligned = (_num_groups / VEC_ALIGNMENT + 1) * VEC_ALIGNMENT;
+  int vec_alignment = VEC_ALIGNMENT / sizeof(FP_PRECISION);
+  int num_groups_aligned = (_NUM_GROUPS / vec_alignment + 1) * vec_alignment;
   FP_PRECISION* fsr_flux_x = &fsr_flux[num_groups_aligned];
   FP_PRECISION* fsr_flux_y = &fsr_flux[2*num_groups_aligned];
   FP_PRECISION* fsr_flux_z = &fsr_flux[3*num_groups_aligned];
 
-  // Atomically increment the FSR scalar flux from the temporary array
+  /* Atomically increment the FSR scalar flux from the temporary array */
   omp_set_lock(&_FSR_locks[fsr_id]);
 
 #pragma omp simd aligned(fsr_flux, fsr_flux_x, fsr_flux_y, fsr_flux_z)
-  for (int e=0; e < _num_groups; e++) {
+  for (int e=0; e < _NUM_GROUPS; e++) {
 
-    // Add to global scalar flux vector
+    /* Add to global scalar flux vector */
     _scalar_flux(fsr_id, e) += weight * fsr_flux[e];
     _scalar_flux_xyz(fsr_id, e, 0) += weight * fsr_flux_x[e];
     _scalar_flux_xyz(fsr_id, e, 1) += weight * fsr_flux_y[e];
@@ -731,6 +771,9 @@ void CPULSSolver::accumulateLinearFluxContribution(long fsr_id,
   }
 
   omp_unset_lock(&_FSR_locks[fsr_id]);
+#ifdef INTEL
+#pragma omp flush
+#endif
 
   /* Reset buffers to 0 */
   memset(fsr_flux, 0, 4 * num_groups_aligned * sizeof(FP_PRECISION));
@@ -763,7 +806,7 @@ void CPULSSolver::addSourceToScalarFlux() {
         volume = 1e30;
       sigma_t = _FSR_materials[r]->getSigmaT();
 
-      for (int e=0; e < _num_groups; e++) {
+      for (int e=0; e < _NUM_GROUPS; e++) {
 
         flux_const = FOUR_PI * 2;
 
@@ -773,29 +816,29 @@ void CPULSSolver::addSourceToScalarFlux() {
 
         _scalar_flux_xyz(r,e,0) /= volume;
         _scalar_flux_xyz(r,e,0) += flux_const * _reduced_sources_xyz(r,e,0)
-            * _FSR_source_constants[r*_num_groups*nc + e];
+            * _FSR_source_constants[r*_NUM_GROUPS*nc + e];
         _scalar_flux_xyz(r,e,0) += flux_const * _reduced_sources_xyz(r,e,1)
-            * _FSR_source_constants[r*_num_groups*nc + 2*_num_groups + e];
+            * _FSR_source_constants[r*_NUM_GROUPS*nc + 2*_NUM_GROUPS + e];
 
         _scalar_flux_xyz(r,e,1) /= volume;
         _scalar_flux_xyz(r,e,1) += flux_const * _reduced_sources_xyz(r,e,0)
-            * _FSR_source_constants[r*_num_groups*nc + 2*_num_groups + e];
+            * _FSR_source_constants[r*_NUM_GROUPS*nc + 2*_NUM_GROUPS + e];
         _scalar_flux_xyz(r,e,1) += flux_const * _reduced_sources_xyz(r,e,1)
-            * _FSR_source_constants[r*_num_groups*nc + _num_groups + e];
+            * _FSR_source_constants[r*_NUM_GROUPS*nc + _NUM_GROUPS + e];
 
         if (_SOLVE_3D) {
           _scalar_flux_xyz(r,e,0) += flux_const * _reduced_sources_xyz(r,e,2)
-              * _FSR_source_constants[r*_num_groups*nc + 3*_num_groups + e];
+              * _FSR_source_constants[r*_NUM_GROUPS*nc + 3*_NUM_GROUPS + e];
           _scalar_flux_xyz(r,e,1) += flux_const * _reduced_sources_xyz(r,e,2)
-              * _FSR_source_constants[r*_num_groups*nc + 4*_num_groups + e];
+              * _FSR_source_constants[r*_NUM_GROUPS*nc + 4*_NUM_GROUPS + e];
 
           _scalar_flux_xyz(r,e,2) /= volume;
           _scalar_flux_xyz(r,e,2) += flux_const * _reduced_sources_xyz(r,e,0)
-              * _FSR_source_constants[r*_num_groups*nc + 3*_num_groups + e];
+              * _FSR_source_constants[r*_NUM_GROUPS*nc + 3*_NUM_GROUPS + e];
           _scalar_flux_xyz(r,e,2) += flux_const * _reduced_sources_xyz(r,e,1)
-              * _FSR_source_constants[r*_num_groups*nc + 4*_num_groups + e];
+              * _FSR_source_constants[r*_NUM_GROUPS*nc + 4*_NUM_GROUPS + e];
           _scalar_flux_xyz(r,e,2) += flux_const * _reduced_sources_xyz(r,e,2)
-              * _FSR_source_constants[r*_num_groups*nc + 5*_num_groups + e];
+              * _FSR_source_constants[r*_NUM_GROUPS*nc + 5*_NUM_GROUPS + e];
         }
 
         _scalar_flux_xyz(r,e,0) /= sigma_t[e];
@@ -806,6 +849,10 @@ void CPULSSolver::addSourceToScalarFlux() {
         if (_scalar_flux(r, e) < 0.0 && !_negative_fluxes_allowed) {
 #pragma omp atomic update
           num_negative_fluxes++;
+          _scalar_flux(r,e) = std::max(_old_scalar_flux(r,e), FLUX_EPSILON);
+          _scalar_flux_xyz(r,e,0) = 0;
+          _scalar_flux_xyz(r,e,1) = 0;
+          _scalar_flux_xyz(r,e,2) = 0;
         }
       }
     }
@@ -858,10 +905,10 @@ void CPULSSolver::computeStabilizingFlux() {
       /* Extract total cross-sections */
       FP_PRECISION* sigma_t = _FSR_materials[r]->getSigmaT();
 
-      for (int e=0; e < _num_groups; e++) {
+      for (int e=0; e < _NUM_GROUPS; e++) {
 
         /* Extract the in-scattering (diagonal) element */
-        FP_PRECISION sigma_s = scattering_matrix[e*_num_groups+e];
+        FP_PRECISION sigma_s = scattering_matrix[e*_NUM_GROUPS+e];
 
         /* For negative cross-sections, add the absolute value of the
            in-scattering rate to the stabilizing flux */
@@ -878,7 +925,7 @@ void CPULSSolver::computeStabilizingFlux() {
 
     /* Treat each group */
 #pragma omp parallel for
-    for (int e=0; e < _num_groups; e++) {
+    for (int e=0; e < _NUM_GROUPS; e++) {
 
       /* Look for largest absolute scattering ratio */
       FP_PRECISION max_ratio = 0.0;
@@ -911,7 +958,7 @@ void CPULSSolver::computeStabilizingFlux() {
     /* Apply the global multiplicative factor */
 #pragma omp parallel for
     for (long r=0; r < _num_FSRs; r++)
-      for (int e=0; e < _num_groups; e++)
+      for (int e=0; e < _NUM_GROUPS; e++)
         for (int i=0; i <3; i++)
           _stabilizing_flux_xyz(r, e, i) = _scalar_flux_xyz(r, e, i)
              * mult_factor;
@@ -942,10 +989,10 @@ void CPULSSolver::stabilizeFlux() {
       /* Extract total cross-sections */
       FP_PRECISION* sigma_t = _FSR_materials[r]->getSigmaT();
 
-      for (int e=0; e < _num_groups; e++) {
+      for (int e=0; e < _NUM_GROUPS; e++) {
 
         /* Extract the in-scattering (diagonal) element */
-        FP_PRECISION sigma_s = scattering_matrix[e*_num_groups+e];
+        FP_PRECISION sigma_s = scattering_matrix[e*_NUM_GROUPS+e];
 
         /* For negative cross-sections, add the stabilizing flux
            and divide by the diagonal matrix element used to form it so that
@@ -964,7 +1011,7 @@ void CPULSSolver::stabilizeFlux() {
 
     /* Treat each group */
 #pragma omp parallel for
-    for (int e=0; e < _num_groups; e++) {
+    for (int e=0; e < _NUM_GROUPS; e++) {
 
       /* Look for largest absolute scattering ratio */
       FP_PRECISION max_ratio = 0.0;
@@ -995,7 +1042,7 @@ void CPULSSolver::stabilizeFlux() {
     /* Apply the damping factor */
 #pragma omp parallel for
     for (long r=0; r < _num_FSRs; r++) {
-      for (int e=0; e < _num_groups; e++) {
+      for (int e=0; e < _NUM_GROUPS; e++) {
         for (int i=0; i <3; i++) {
           _scalar_flux_xyz(r, e, i) += _stabilizing_flux_xyz(r, e, i);
           _scalar_flux_xyz(r, e, i) *= _stabilization_factor;

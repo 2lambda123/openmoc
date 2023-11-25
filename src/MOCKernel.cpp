@@ -382,7 +382,7 @@ void TransportKernel::execute(FP_PRECISION length, Material* mat, long fsr_id,
 
   /* Allocate a buffer to store flux contribution of all cuts in this fsr */
   FP_PRECISION fsr_flux[_num_groups] __attribute__ ((aligned (VEC_ALIGNMENT)));
-  memset(&fsr_flux[0], 0, _num_groups * sizeof(FP_PRECISION));
+  memset(fsr_flux, 0, _num_groups * sizeof(FP_PRECISION));
 
   /* Apply MOC equations to segments */
   for (int i=0; i < num_cuts; i++) {
@@ -394,8 +394,8 @@ void TransportKernel::execute(FP_PRECISION length, Material* mat, long fsr_id,
     curr_segment._region_id = fsr_id;
 
     /* Apply MOC equations */
-    _cpu_solver->tallyScalarFlux(&curr_segment, _azim_index, _polar_index,
-                                 fsr_flux, track_flux);
+    _cpu_solver->tallyScalarFlux(&curr_segment, _azim_index, fsr_flux,
+                                 track_flux);
 
     /* CMFD surfaces can only be on the segment ends, and the propagation is
        always in the forward direction */

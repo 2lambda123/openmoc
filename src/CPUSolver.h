@@ -22,7 +22,9 @@
 #undef track_flux
 /** Optimization macro to facilitate SIMD vectorization */
 #ifdef NGROUPS
-#define _num_groups (NGROUPS)
+#define _NUM_GROUPS (NGROUPS)
+#else
+#define _NUM_GROUPS (_num_groups)
 #endif
 
 /** Indexing macro for the angular fluxes for each polar angle and energy
@@ -124,8 +126,6 @@ protected:
   void deleteMPIBuffers();
   void packBuffers(std::vector<long> &packing_indexes);
   void transferAllInterfaceFluxes();
-  void printCycle(long track_start, int domain_start, int length);
-  void boundaryFluxChecker();
 #endif
 #ifdef ONLYVACUUMBC
   void resetBoundaryFluxes();
@@ -152,11 +152,12 @@ public:
   void setNumThreads(int num_threads);
   void setFluxes(FP_PRECISION* in_fluxes, int num_fluxes);
   void setFixedSourceByFSR(long fsr_id, int group, FP_PRECISION source);
-  void computeFSRFissionRates(double* fission_rates, long num_FSRs, 
+  void resetFixedSources();
+  void computeFSRFissionRates(double* fission_rates, long num_FSRs,
                               bool nu = false);
   void printInputParamsSummary();
 
-  void tallyScalarFlux(segment* curr_segment, int azim_index, int polar_index,
+  void tallyScalarFlux(segment* curr_segment, int azim_index,
                        FP_PRECISION* fsr_flux, float* track_flux);
 
   void accumulateScalarFluxContribution(long fsr_id, FP_PRECISION weight,
@@ -176,6 +177,12 @@ public:
                       const char* plane);
   void printFluxesTemp();
   void printNegativeSources(int iteration, int num_x, int num_y, int num_z);
+
+#ifdef MPIx
+  void printCycle(long track_start, int domain_start, int length);
+  void printLoadBalancingReport();
+  void boundaryFluxChecker();
+#endif
 };
 
 

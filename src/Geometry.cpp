@@ -498,6 +498,100 @@ void Geometry::manipulateXS() {
 
 
 /**
+ * @brief Loads an array of SPH factors into the geometry's domains.
+ * @details This method is called by compute_sph_factors in the 'materialize'
+ *          module but may also be called by the user in Python if needed:
+ *
+ * @code
+ *          geometry.loadSPHFactors(sph_factors.flatten(),
+ *                                  double(sph_to_domains), "cell")
+ * @endcode
+ * @param sph_factors 1D array of SPH factors (group dependence in inner loop)
+ * @param num_domains_groups number of domains times number of groups
+ * @param sph_to_domain_ids map to link sph_factors array into domains, must be
+          doubles //FIXME write a typemap to allow ints
+ * @param num_domains total number of domains (may be larger than the number of
+          domains in the OpenMOC geometry)
+ * @param domain_type type of domain (material or cell) containing the cross
+ *        sections that the SPH factors apply to
+ */
+void Geometry::loadSPHFactors(double* sph_factors, int num_domains_groups,
+                              double* sph_to_domain_ids, int num_sph_domains,
+                              const char* domain_type) {
+
+  /* Check type of domain */
+  if (strcmp(domain_type, "material") != 0 && strcmp(domain_type, "cell") != 0)
+    log_printf(ERROR, "Domain type %s is not supported for loading SPH factor",
+               &domain_type[0]);
+
+  int num_groups = getNumEnergyGroups();
+
+  /* If by material, loop on materials */
+  if (strcmp(domain_type, "material") == 0) {
+    std::map<int, Material*> all_materials = getAllMaterials();
+    std::map<int, Material*>::iterator iter;
+
+    for (int i=0; i<num_sph_domains; i++) {
+
+      /* Find material */
+      iter = all_materials.find(int(sph_to_domain_ids[i]));
+      if (iter == all_materials.end()) {
+        log_printf(WARNING, "SPH material %d is not in geometry",
+                   int(sph_to_domain_ids[i]));
+        continue;
+      }
+      Material* mat = iter->second;
+
+      /* Use sph factors */
+      double* sph = &sph_factors[i*num_groups];
+
+      for (int g=1; g<=num_groups; g++) {
+
+        mat->setSigmaTByGroup(mat->getSigmaTByGroup(g) * sph[g-1], g);
+        mat->setSigmaAByGroup(mat->getSigmaAByGroup(g) * sph[g-1], g);
+        mat->setSigmaFByGroup(mat->getSigmaFByGroup(g) * sph[g-1], g);
+        mat->setNuSigmaFByGroup(mat->getNuSigmaFByGroup(g) * sph[g-1], g);
+        for (int g2=1; g2<=num_groups; g2++) {
+          mat->setSigmaSByGroup(mat->getSigmaSByGroup(g, g2) * sph[g-1], g, g2);
+        }
+      }
+    }
+  }
+  /* SPH factors by cells */
+  if (strcmp(domain_type, "cell") == 0) {
+    std::map<int, Cell*> all_cells = getAllMaterialCells();
+    std::map<int, Cell*>::iterator iter;
+
+    for (int i=0; i<num_sph_domains; i++) {
+
+      /* Find cell then material to use SPH factor on */
+      iter = all_cells.find(int(sph_to_domain_ids[i]));
+      if (iter == all_cells.end()) {
+        log_printf(WARNING, "SPH cell %d is not in geometry",
+                   int(sph_to_domain_ids[i]));
+        continue;
+      }
+      Material* mat = iter->second->getFillMaterial();
+
+      /* Use sph factors */
+      double* sph = &sph_factors[i*num_groups];
+
+      for (int g=1; g<=num_groups; g++) {
+
+        mat->setSigmaTByGroup(mat->getSigmaTByGroup(g) * sph[g-1], g);
+        mat->setSigmaAByGroup(mat->getSigmaAByGroup(g) * sph[g-1], g);
+        mat->setSigmaFByGroup(mat->getSigmaFByGroup(g) * sph[g-1], g);
+        mat->setNuSigmaFByGroup(mat->getNuSigmaFByGroup(g) * sph[g-1], g);
+        for (int g2=1; g2<=num_groups; g2++) {
+          mat->setSigmaSByGroup(mat->getSigmaSByGroup(g, g2) * sph[g-1], g, g2);
+        }
+      }
+    }
+  }
+}
+
+
+/**
  * @brief Return a std::map container of Cell IDs (keys) with Cells
  *        pointers (values).
  * @return a std::map of Cells indexed by Cell ID in the geometry
@@ -688,7 +782,7 @@ void Geometry::useSymmetry(bool X_symmetry, bool Y_symmetry, bool Z_symmetry) {
 #ifdef ONLYVACUUMBC
   if (X_symmetry || Y_symmetry || Z_symmetry)
     log_printf(ERROR, "Using symmetries requires reflective boundary conditions"
-               ", re-compile without the ONLYVACUUMBC flag.")
+               ", re-compile without the ONLYVACUUMBC flag.");
 #endif
 
   // Keep track of symmetries used
@@ -1068,8 +1162,7 @@ Cell* Geometry::findNextCell(LocalCoords* coords, double azim, double polar) {
   double dist;
   double min_dist = std::numeric_limits<double>::infinity();
 
-  /* Save coords and angles in case of a translated/rotated cell */
-  double old_position[3] = {coords->getX(), coords->getY(), coords->getZ()};
+  /* Save angles in case of a rotated cell */
   double old_azim = azim;
   double old_polar = polar;
 
@@ -1107,30 +1200,11 @@ Cell* Geometry::findNextCell(LocalCoords* coords, double azim, double polar) {
         Cell* cell = coords->getCell();
         dist = cell->minSurfaceDist(coords->getPoint(), azim, polar);
 
-        /* Apply translation to position */
-        if (cell->isTranslated()) {
-          double* translation = cell->getTranslation();
-          double new_x = coords->getX() - translation[0];
-          double new_y = coords->getY() - translation[1];
-          double new_z = coords->getZ() - translation[2];
-          coords->setX(new_x);
-          coords->setY(new_y);
-          coords->setZ(new_z);
-        }
-
-        /* Apply rotation to position and direction */
+        /* Apply rotation to direction. Position has already been modified by
+           universe->findCell() in findCellContainingCoords() */
         if (cell->isRotated()) {
-          double x = coords->getX();
-          double y = coords->getY();
-          double z = coords->getZ();
-          double* matrix = cell->getRotationMatrix();
-          double new_x = matrix[0] * x + matrix[1] * y + matrix[2] * z;
-          double new_y = matrix[3] * x + matrix[4] * y + matrix[5] * z;
-          double new_z = matrix[6] * x + matrix[7] * y + matrix[8] * z;
-          coords->setX(new_x);
-          coords->setY(new_y);
-          coords->setZ(new_z);
 
+          double* matrix = cell->getRotationMatrix();
           double uvw[3] = {sin(polar)*cos(azim), sin(polar)*sin(azim),
                            cos(polar)};
           double rot_uvw[3] = {matrix[0]*uvw[0] + matrix[1]*uvw[1] +
@@ -1139,9 +1213,9 @@ Cell* Geometry::findNextCell(LocalCoords* coords, double azim, double polar) {
                                matrix[6]*uvw[0] + matrix[7]*uvw[1] +
                                matrix[8]*uvw[2]};
           polar = acos(rot_uvw[2]);
-          double sin_p = sqrt(1 - rot_uvw[2]*rot_uvw[2]);
-          int sgn = (asin(rot_uvw[1]/sin_p) > 0) - (asin(rot_uvw[1]/sin_p) < 0);
-          azim = acos(rot_uvw[0]/sin_p) * sgn;
+          azim = atan2(rot_uvw[1], rot_uvw[0]);
+          if (azim < 0)
+            azim += 2 * M_PI;
         }
       }
 
@@ -1155,12 +1229,9 @@ Cell* Geometry::findNextCell(LocalCoords* coords, double azim, double polar) {
         coords = coords->getNext();
     }
 
-    /* Reset coords position in case there was a translated or rotated cell */
+    /* Reset coords direction in case there was a rotated cell */
     coords = coords->getHighestLevel();
     coords->prune();
-    coords->setX(old_position[0]);
-    coords->setY(old_position[1]);
-    coords->setZ(old_position[2]);
     azim = old_azim;
     polar = old_polar;
 
@@ -1621,7 +1692,22 @@ int Geometry::getCmfdCell(long fsr_id) {
 
 
 /**
- * @brief reserves the FSR key strings
+ * @brief Reserves memory for threaded constructs used by the Geometry class.
+ * @param num_threads the number of threads
+ */
+void Geometry::setNumThreads(int num_threads) {
+
+  /* Allocate fsr_keys for enough threads */
+  reserveKeyStrings(num_threads);
+
+  /* Allocate threaded constructs of the ExtrudedFSR maps */
+  _FSR_keys_map.setNumThreads(num_threads);
+  _extruded_FSR_keys_map.setNumThreads(num_threads);
+}
+
+
+/**
+ * @brief Reserves memory for the FSR key strings for each thread
  * @param num_threads the number of threads
  */
 void Geometry::reserveKeyStrings(int num_threads) {
@@ -2529,7 +2615,8 @@ void Geometry::fixFSRMaps() {
  *          initializing the 3D FSRs as new regions are traversed.
  * @param global_z_mesh A global z mesh used for ray tracing. If the vector's
  *        length is zero, z meshes are local and need to be created for every
- *        ExtrudedFSR.
+ *        ExtrudedFSR. The global_z_mesh is local to the domain when using
+ *        domain decomposition.
  */
 void Geometry::initializeAxialFSRs(std::vector<double> global_z_mesh) {
 
@@ -2549,7 +2636,11 @@ void Geometry::initializeAxialFSRs(std::vector<double> global_z_mesh) {
   int anticipated_size = 2 * _extruded_FSR_keys_map.size();
   if (_overlaid_mesh != NULL)
     anticipated_size *= _overlaid_mesh->getNumZ();
-  _FSR_keys_map.realloc(anticipated_size);
+  else
+    if (_cmfd != NULL)
+      anticipated_size *= _cmfd->getLocalNumZ();
+  if (anticipated_size > _FSR_keys_map.bucket_count())
+    _FSR_keys_map.realloc(anticipated_size);
   long total_number_fsrs_in_stack = 0;
 
   /* Loop over extruded FSRs */
@@ -2625,7 +2716,7 @@ void Geometry::initializeAxialFSRs(std::vector<double> global_z_mesh) {
         level += segments[s]._length;
         if (std::abs(level - max_z) < 1e-12)
           level = max_z;
-      extruded_FSR->_mesh[s+1] = level;
+        extruded_FSR->_mesh[s+1] = level;
       }
     }
     /* Keep track of the number of FSRs in extruded FSRs */
@@ -2743,6 +2834,7 @@ void Geometry::initializeFSRVectors() {
   _FSRs_to_centroids = std::vector<Point*>(num_FSRs, NULL);
   _FSRs_to_material_IDs = std::vector<int>(num_FSRs);
   _FSRs_to_CMFD_cells = std::vector<int>(num_FSRs);
+  _contains_FSR_centroids = false;
 
   /* Fill vectors key and material ID information */
 #pragma omp parallel for
@@ -2899,33 +2991,36 @@ std::vector<long> Geometry::getSpatialDataOnGrid(std::vector<double> dim1,
   /* Instantiate a vector to hold the domain IDs */
   std::vector<long> domains(dim1.size() * dim2.size());
 
+  /* Allocate fsr keys in case the track generator has not */
+  setNumThreads(omp_get_max_threads());
+
   /* Extract the source region IDs */
-//#pragma omp parallel for
+#pragma omp parallel for collapse(2)
   for (int i=0; i < dim1.size(); i++) {
     for (int j=0; j < dim2.size(); j++) {
 
       Cell* cell;
-      LocalCoords* point;
+      LocalCoords point(0, 0, 0, true);
 
       /* Find the Cell containing this point */
       if (strcmp(plane, "xy") == 0)
-        point = new LocalCoords(dim1[i], dim2[j], offset, true);
+        point.getPoint()->setCoords(dim1[i], dim2[j], offset);
       else if (strcmp(plane, "xz") == 0)
-        point = new LocalCoords(dim1[i], offset, dim2[j], true);
+        point.getPoint()->setCoords(dim1[i], offset, dim2[j]);
       else if (strcmp(plane, "yz") == 0)
-        point = new LocalCoords(offset, dim1[i], dim2[j], true);
+        point.getPoint()->setCoords(offset, dim1[i], dim2[j]);
       else
         log_printf(ERROR, "Unable to extract spatial data for "
                           "unsupported plane %s", plane);
 
-      point->setUniverse(_root_universe);
-      cell = _root_universe->findCell(point);
+      point.setUniverse(_root_universe);
+      cell = _root_universe->findCell(&point);
       domains[i+j*dim1.size()] = -1;
 
       /* Extract the ID of the domain of interest */
-      if (withinGlobalBounds(point) && cell != NULL) {
+      if (withinGlobalBounds(&point) && cell != NULL) {
         if (strcmp(domain_type, "fsr") == 0)
-          domains[i+j*dim1.size()] = getGlobalFSRId(point, false);
+          domains[i+j*dim1.size()] = getGlobalFSRId(&point, false);
         else if (strcmp(domain_type, "material") == 0)
           domains[i+j*dim1.size()] = cell->getFillMaterial()->getId();
         else if (strcmp(domain_type, "cell") == 0)
@@ -2933,12 +3028,7 @@ std::vector<long> Geometry::getSpatialDataOnGrid(std::vector<double> dim1,
         else
           log_printf(ERROR, "Unable to extract spatial data for "
                             "unsupported domain type %s", domain_type);
-
       }
-
-      /* Deallocate memory for LocalCoords */
-      point = point->getHighestLevel();
-      delete point;
     }
   }
 
@@ -3221,8 +3311,8 @@ void Geometry::initializeSpectrumCalculator(Cmfd* spectrum_calculator) {
   offset.setY(min_y + (max_y - min_y)/2.0);
   offset.setZ(min_z + (max_z - min_z)/2.0);
 
-  spectrum_calculator->initializeLattice(&offset);
   spectrum_calculator->setGeometry(this);
+  spectrum_calculator->initializeLattice(&offset);
 
 #ifdef MPIx
   if (_domain_decomposed) {
@@ -3352,12 +3442,9 @@ Cell* Geometry::findCellContainingFSR(long fsr_id) {
 
   std::string& key = _FSRs_to_keys[fsr_id];
   Point* point = _FSR_keys_map.at(key)->_point;
-  LocalCoords* coords = new LocalCoords(point->getX(), point->getY(),
-                                        point->getZ(), true);
-  coords->setUniverse(_root_universe);
-  Cell* cell = findCellContainingCoords(coords);
-
-  delete coords;
+  LocalCoords coords(point->getX(), point->getY(), point->getZ(), true);
+  coords.setUniverse(_root_universe);
+  Cell* cell = findCellContainingCoords(&coords);
 
   return cell;
 }
@@ -3381,6 +3468,17 @@ void Geometry::setFSRCentroid(long fsr, Point* centroid) {
   std::string& key = _FSRs_to_keys[fsr];
   _FSR_keys_map.at(key)->_centroid = centroid;
   _FSRs_to_centroids[fsr] = centroid;
+}
+
+
+/**
+ * @brief Sets the boolean keeping track of FSR centroids generation to false.
+ * @details The FSR numbering may change if trying to use the same geometry
+ *          in a restart run. The centroids generated with the previous FSR
+ *          numbering should not be used when ray tracing again.
+ */
+void Geometry::resetContainsFSRCentroids() {
+  _contains_FSR_centroids = false;
 }
 
 
@@ -3608,6 +3706,9 @@ void Geometry::dumpToFile(std::string filename) {
 
   FILE* out;
   out = fopen(filename.c_str(), "w");
+  if (out == NULL)
+    log_printf(ERROR, "Geometry file %s cannot be written. Wrong folder?",
+               &filename[0]);
 
   /* Print number of energy groups */
   int num_groups = getNumEnergyGroups();
@@ -3972,7 +4073,9 @@ void Geometry::loadFromFile(std::string filename, bool twiddle) {
   if (_root_universe != NULL)
     delete _root_universe;
 
-  log_printf(NORMAL, "Reading Geometry from %s", filename.c_str());
+  log_printf(NORMAL, "Reading Geometry from %s", &filename[0]);
+  if (in == NULL)
+    log_printf(ERROR, "Geometry file %s was not found.", &filename[0]);
 
   std::map<int, Surface*> all_surfaces;
   std::map<int, Cell*> all_cells;
@@ -4235,11 +4338,13 @@ void Geometry::loadFromFile(std::string filename, bool twiddle) {
         i_subnodes.push_back(num_subnodes+1);
 
       /* Remove zero values from subnode vector, and go up in region tree */
-      for (iter=i_subnodes.begin(); iter<i_subnodes.end(); iter++) {
+      for (iter=i_subnodes.begin(); iter<i_subnodes.end(); ) {
         if ((*iter) == 0) {
           i_subnodes.erase(iter);
           all_cells[key]->goUpOneRegionLogical();
         }
+        else
+          iter++;
       }
 
       /* Add surface */
